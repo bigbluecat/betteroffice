@@ -13,11 +13,13 @@ from ._betteroffice_xlsx import XlsxError, __version__
 __all__ = [
     "Calculation",
     "CellError",
+    "CellValue",
     "ParseError",
     "Png",
     "RangeError",
     "RenderError",
     "Sheet",
+    "SheetKey",
     "Workbook",
     "XlsxError",
     "__version__",

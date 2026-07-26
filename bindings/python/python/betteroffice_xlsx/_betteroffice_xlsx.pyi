@@ -1,5 +1,5 @@
 import os
-from typing import Any, final
+from typing import final
 
 __version__: str
 
@@ -50,7 +50,9 @@ class Workbook:
     @property
     def sheet_names(self) -> list[str]: ...
     def sheet_index(self, sheet: int | str) -> int: ...
-    def value(self, sheet: int | str, address: str) -> Any: ...
+    def value(
+        self, sheet: int | str, address: str
+    ) -> bool | float | str | CellError | None: ...
     def formula(self, sheet: int | str, address: str) -> str | None: ...
     def set(
         self,

@@ -46,11 +46,21 @@ jobs:
           workspaces: bindings/python
 
       - name: Install build and test dependencies
-        run: python -m pip install --upgrade "maturin>=1.7,<2.0" pytest
+        run: python -m pip install --upgrade "maturin>=1.7,<2.0" pytest mypy
 
       - name: Build and install the extension
         working-directory: bindings/python
         run: maturin develop
+
+      - name: Lint Rust
+        working-directory: bindings/python
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Type check
+        working-directory: bindings/python
+        run: mypy --strict python/betteroffice_xlsx
 
       - name: Test
         working-directory: bindings/python
