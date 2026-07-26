@@ -1,6 +1,10 @@
 node_modules/
 dist/
 target/
+.venv/
+__pycache__/
+.pytest_cache/
+*.so
 .next/
 .source/
 .open-next/

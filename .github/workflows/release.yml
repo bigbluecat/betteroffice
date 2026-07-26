@@ -17,6 +17,8 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    outputs:
+      publishing: ${{ steps.pending.outputs.publishing }}
     permissions:
       contents: write
       pull-requests: write
@@ -123,3 +125,54 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh workflow run deploy.yml --ref main
+
+  # Wheels and sdist for the Python bindings. Version lives in
+  # bindings/python/pyproject.toml, outside changesets, so publishing is
+  # idempotent: an unchanged version is skipped rather than failing.
+  python-build:
+    name: Python artifacts
+    needs: release
+    if: needs.release.outputs.publishing == 'true'
+    uses: ./.github/workflows/python.yml
+
+  python-publish:
+    name: Publish to PyPI
+    needs: python-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write # OIDC Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Detect PyPI token
+        id: pypi-token
+        env:
+          TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish with API token
+        if: steps.pypi-token.outputs.enabled == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          packages-dir: dist
+          skip-existing: true
+
+      # No token configured: fall back to OIDC Trusted Publishing, which needs
+      # a publisher for openooxml/betteroffice registered on PyPI.
+      - name: Publish via Trusted Publishing
+        if: steps.pypi-token.outputs.enabled != 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
