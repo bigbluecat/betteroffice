@@ -52,6 +52,9 @@ module-name = "betteroffice_xlsx._betteroffice_xlsx"
 python-source = "python"
 features = ["pyo3/extension-module"]
 strip = true
+# Without this a local test run's bytecode cache gets baked into the wheel,
+# pinning one interpreter version inside an abi3 artifact.
+exclude = ["**/__pycache__/**", "**/*.pyc", "**/*.so"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
