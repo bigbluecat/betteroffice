@@ -98,9 +98,13 @@ struct ChartSink<'a> {
 }
 
 impl PlotSink for ChartSink<'_> {
-    fn push_op(&mut self, op: PlotOp) {
+    fn accepts_more(&mut self) -> bool {
+        self.remaining > 0 && self.error.is_none()
+    }
+
+    fn push_op(&mut self, op: PlotOp) -> bool {
         if self.remaining == 0 || self.error.is_some() {
-            return;
+            return false;
         }
         self.remaining -= 1;
         let primitive = match op {
@@ -194,12 +198,13 @@ impl PlotSink for ChartSink<'_> {
                     Ok(primitive) => primitive,
                     Err(error) => {
                         self.error = Some(error);
-                        return;
+                        return false;
                     }
                 }
             }
         };
         self.primitives.push(primitive);
+        true
     }
 }
 

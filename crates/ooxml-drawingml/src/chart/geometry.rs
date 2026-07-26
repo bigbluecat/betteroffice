@@ -195,14 +195,19 @@ pub enum PlotOp {
     },
 }
 
-/// Receives plot ops in back-to-front order as they are produced.
+/// Receives plot ops in order and returns whether plotting may continue.
 pub trait PlotSink {
-    fn push_op(&mut self, op: PlotOp);
+    fn accepts_more(&mut self) -> bool {
+        true
+    }
+
+    fn push_op(&mut self, op: PlotOp) -> bool;
 }
 
 impl PlotSink for Vec<PlotOp> {
-    fn push_op(&mut self, op: PlotOp) {
+    fn push_op(&mut self, op: PlotOp) -> bool {
         self.push(op);
+        true
     }
 }
 
@@ -967,15 +972,18 @@ struct Emitter<'s, S: PlotSink + ?Sized> {
 
 impl<S: PlotSink + ?Sized> Emitter<'_, S> {
     fn push(&mut self, op: PlotOp) {
-        if self.remaining == 0 {
+        if self.exhausted() {
             return;
         }
-        self.remaining -= 1;
-        self.sink.push_op(op);
+        if self.sink.push_op(op) {
+            self.remaining -= 1;
+        } else {
+            self.remaining = 0;
+        }
     }
 
-    fn exhausted(&self) -> bool {
-        self.remaining == 0
+    fn exhausted(&mut self) -> bool {
+        self.remaining == 0 || !self.sink.accepts_more()
     }
 }
 
@@ -1314,7 +1322,7 @@ fn push_rect<S: PlotSink + ?Sized>(
     h: f64,
     fill: &str,
 ) {
-    if w <= 0.0 || h <= 0.0 {
+    if w <= 0.0 || h <= 0.0 || ops.exhausted() {
         return;
     }
     ops.push(PlotOp::Rect {
@@ -1334,7 +1342,7 @@ fn push_text<S: PlotSink + ?Sized>(
     width: f64,
     style: &ResolvedText,
 ) {
-    if text.is_empty() || width <= 0.0 {
+    if text.is_empty() || width <= 0.0 || ops.exhausted() {
         return;
     }
     ops.push(PlotOp::Text {
@@ -1356,6 +1364,9 @@ fn push_line<S: PlotSink + ?Sized>(
     color: &str,
     width: f64,
 ) {
+    if ops.exhausted() {
+        return;
+    }
     ops.push(PlotOp::Line {
         x1,
         y1,
@@ -2951,12 +2962,13 @@ fn emit_pie<S: PlotSink + ?Sized>(
         .len()
         .max(series.series.points.len())
         .min(MAX_PLOT_DATA_SCAN);
-    let values: Vec<(usize, f64)> = (0..scanned)
+    let available = ops.remaining;
+    let total: f64 = (0..scanned)
         .map(|index| (index, series.value(index)))
         .filter(|(_, value)| *value > 0.0 && value.is_finite())
-        .take(ops.remaining)
-        .collect();
-    let total: f64 = values.iter().map(|(_, value)| value).sum();
+        .take(available)
+        .map(|(_, value)| value)
+        .sum();
     if total <= 0.0 {
         return;
     }
@@ -2983,21 +2995,25 @@ fn emit_pie<S: PlotSink + ?Sized>(
             .to_radians();
     let vary = group.is_some_and(|group| group.vary_colors);
     let mut angle = start;
-    for (index, value) in &values {
-        let sweep = (*value / total) * std::f64::consts::TAU;
+    for (index, value) in (0..scanned)
+        .map(|index| (index, series.value(index)))
+        .filter(|(_, value)| *value > 0.0 && value.is_finite())
+        .take(available)
+    {
+        let sweep = (value / total) * std::f64::consts::TAU;
         let middle = angle + sweep / 2.0;
-        let offset = r * series.explosion(*index) / 100.0;
+        let offset = r * series.explosion(index) / 100.0;
         let (ox, oy) = (cx + offset * middle.cos(), cy + offset * middle.sin());
         let color = if vary {
             series
-                .point(*index)
+                .point(index)
                 .and_then(|point| point.color)
                 .map(hex)
                 .unwrap_or_else(|| {
-                    CHART_SERIES_COLORS[*index % CHART_SERIES_COLORS.len()].to_owned()
+                    CHART_SERIES_COLORS[index % CHART_SERIES_COLORS.len()].to_owned()
                 })
         } else {
-            series.point_color(*index, *index)
+            series.point_color(index, index)
         };
         ops.push(PlotOp::Path {
             x: ox - r,
@@ -3011,15 +3027,14 @@ fn emit_pie<S: PlotSink + ?Sized>(
                 width: 1.0,
             }),
         });
-        let reach = r * pie_label_reach(
-            point_label_spec(series, *index).and_then(|labels| labels.position),
-        );
+        let reach =
+            r * pie_label_reach(point_label_spec(series, index).and_then(|labels| labels.position));
         push_point_label(
             ops,
             family,
             series,
-            *index,
-            *index,
+            index,
+            index,
             ox + reach * middle.cos(),
             oy + reach * middle.sin(),
             48.0,
@@ -5378,8 +5393,9 @@ mod tests {
         };
         struct Counter(usize);
         impl PlotSink for Counter {
-            fn push_op(&mut self, _: PlotOp) {
+            fn push_op(&mut self, _: PlotOp) -> bool {
                 self.0 += 1;
+                true
             }
         }
         let mut counter = Counter(0);

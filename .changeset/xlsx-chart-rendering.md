@@ -1,0 +1,8 @@
+---
+"@betteroffice/xlsx": patch
+"@betteroffice/rust-crates": patch
+---
+
+Worksheet charts now render in both the browser canvas and native PNG output. Two-cell, one-cell and absolute anchors follow worksheet geometry, including hidden rows and columns, viewport scrolling, partial visibility and frozen panes. Column, bar, line, pie and doughnut charts use the shared chart geometry, chart paths have matching fill and stroke behavior in both backends, and visible charts now carry screen-reader labels. Charts paint above cells, gridlines and proposal ghosts, while frozen-pane dividers and the editor's selection, presence and editing overlays remain above them. A frame that would exceed 65,536 chart operations is refused with a visible rendering error instead of returning a plausible-looking partial frame.
+
+Known limits. Area, scatter, radar, stock, bubble, of-pie and surface chart families are refused because the shared geometry does not render them faithfully yet, and 3-D chart plots are refused. Stacked and percent-stacked grouping, secondary-axis combinations and logarithmic axes are also refused. The renderer does not yet reproduce authored chart-area and plot-area fills, gradients, pattern or picture fills, transparency, shape effects, shadows, glow, bevels, trendlines, error bars, drop lines, high-low lines, up/down bars, data tables or data-label layout. Axis titles, tick formatting and placement, custom number formats, line smoothing, marker symbols, pie rotation and authored doughnut hole size are not yet reproduced; fonts use the backend's available Calibri-compatible face, and unsupported text and shape effects are omitted.

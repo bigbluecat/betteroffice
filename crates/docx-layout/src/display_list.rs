@@ -7917,7 +7917,7 @@ struct PrimitiveSink<'a> {
 }
 
 impl PlotSink for PrimitiveSink<'_> {
-    fn push_op(&mut self, op: PlotOp) {
+    fn push_op(&mut self, op: PlotOp) -> bool {
         let (prims, attrs) = (&mut *self.prims, self.attrs);
         match op {
             PlotOp::Rect { x, y, w, h, fill } => prims.push(Primitive::Rect(RectPrimitive {
@@ -8000,6 +8000,7 @@ impl PlotSink for PrimitiveSink<'_> {
                 attrs: attrs.clone(),
             })),
         }
+        true
     }
 }
 
