@@ -32,7 +32,6 @@ def test_value_and_formula_are_separate(sample_bytes):
 
 
 def test_recalculated_open_agrees_with_authored_values(sample_bytes):
-    """The engine must reproduce what the authoring application cached."""
     cached = bo.Workbook.open(sample_bytes)
     fresh = bo.Workbook.open_recalculated(sample_bytes)
     for address in ("D3", "D4", "D5", "D6", "D7"):
@@ -126,7 +125,6 @@ def test_typed_input_is_interpreted_like_excel(sample_bytes):
 
 
 def test_dates_are_rejected_rather_than_silently_stringified(sample_bytes):
-    """str(datetime) would land text that only looks like a date."""
     import datetime
 
     sheet = bo.Workbook.open(sample_bytes)["Budget"]
@@ -139,8 +137,54 @@ def test_dates_are_rejected_rather_than_silently_stringified(sample_bytes):
             sheet["H14"] = value
 
 
+def test_non_finite_numbers_are_rejected(sample_bytes):
+    from decimal import Decimal
+
+    sheet = bo.Workbook.open(sample_bytes)["Budget"]
+    for value in (float("nan"), float("inf"), float("-inf"), Decimal("Infinity")):
+        with pytest.raises(ValueError, match="finite"):
+            sheet["H14"] = value
+    with pytest.raises(ValueError):
+        sheet["H14"] = 10**400
+
+
+def test_bool_is_not_a_sheet_index(sample_bytes):
+    wb = bo.Workbook.open(sample_bytes)
+    for value in (True, False):
+        with pytest.raises(TypeError, match="not bool"):
+            wb.sheet(value)
+
+
+def test_out_of_range_int_keys_raise_index_error(sample_bytes):
+    wb = bo.Workbook.open(sample_bytes)
+    for value in (-1, 99, 10**100):
+        with pytest.raises(IndexError):
+            wb.sheet(value)
+
+
+def test_missing_file_raises_file_not_found(tmp_path):
+    missing = tmp_path / "nope.xlsx"
+    with pytest.raises(FileNotFoundError) as caught:
+        bo.Workbook.open_path(missing)
+    assert caught.value.errno is not None
+    assert caught.value.filename == str(missing)
+
+
+def test_unwritable_save_path_raises_oserror(sample_bytes, tmp_path):
+    target = tmp_path / "missing-dir" / "out.xlsx"
+    with pytest.raises(OSError) as caught:
+        bo.Workbook.open(sample_bytes).save_path(target)
+    assert caught.value.filename == str(target)
+
+
+def test_declared_version_matches_runtime(sample_bytes):
+    import importlib.metadata as metadata
+
+    assert metadata.version("betteroffice-xlsx") == bo.__version__
+
+
 def test_error_value_hash_matches_its_string(sample_bytes):
-    """__eq__ accepts a str, so __hash__ must agree or dict lookups break."""
+    """Equal objects must hash equally, including against a plain str."""
     wb = bo.Workbook.open(sample_bytes)
     wb.set("Budget", "H5", "=1/0")
     value = wb.value("Budget", "H5")
@@ -151,7 +195,7 @@ def test_error_value_hash_matches_its_string(sample_bytes):
 
 
 def test_workbook_is_usable_from_another_thread(sample_bytes):
-    """The pyclass is not `unsendable`, so worker threads must not panic."""
+    """Not `unsendable`: worker threads must not panic."""
     import threading
 
     wb = bo.Workbook.open(sample_bytes)
@@ -169,7 +213,6 @@ def test_workbook_is_usable_from_another_thread(sample_bytes):
 
 
 def test_concurrent_renders_are_consistent(sample_bytes):
-    """render_png releases the GIL, so parallel renders must not race."""
     from concurrent.futures import ThreadPoolExecutor
 
     wb = bo.Workbook.open(sample_bytes)
@@ -182,7 +225,6 @@ def test_concurrent_renders_are_consistent(sample_bytes):
 
 
 def test_concurrent_opens_are_consistent(sample_bytes):
-    """open parses off the GIL from a copied buffer."""
     from concurrent.futures import ThreadPoolExecutor
 
     with ThreadPoolExecutor(max_workers=4) as pool:

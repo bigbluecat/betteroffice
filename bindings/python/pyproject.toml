@@ -4,12 +4,10 @@ build-backend = "maturin"
 
 [project]
 name = "betteroffice-xlsx"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Read, recalculate, render, and write XLSX workbooks. Rust engine, no Excel and no LibreOffice."
 readme = "README.md"
 license = "Apache-2.0"
-# The extension embeds an OFL-licensed font (see THIRD-PARTY-NOTICES.md), whose
-# license text has to travel with the wheel.
 license-files = [
   "LICENSE",
   "NOTICE",
@@ -52,8 +50,6 @@ module-name = "betteroffice_xlsx._betteroffice_xlsx"
 python-source = "python"
 features = ["pyo3/extension-module"]
 strip = true
-# Without this a local test run's bytecode cache gets baked into the wheel,
-# pinning one interpreter version inside an abi3 artifact.
 exclude = ["**/__pycache__/**", "**/*.pyc", "**/*.so"]
 
 [tool.pytest.ini_options]

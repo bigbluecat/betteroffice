@@ -1,8 +1,4 @@
 //! PyO3 bindings over the `betteroffice-xlsx` facade.
-//!
-//! The Rust surface here is deliberately flat: every method takes a resolved
-//! sheet plus an A1 address. The ergonomic `Sheet` proxy lives in the Python
-//! layer, which keeps borrow lifetimes out of the boundary.
 
 use std::fs;
 use std::path::PathBuf;
@@ -10,7 +6,7 @@ use std::path::PathBuf;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyIndexError, PyKeyError, PyOSError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBool, PyBytes, PyInt};
 
 use betteroffice_xlsx::{
     CalculationOptions, CellRange, CellRef, CellValue, Error as CoreError, RenderOptions, SheetId,
@@ -62,6 +58,15 @@ fn map_error(error: CoreError) -> PyErr {
     }
 }
 
+/// The 3-argument form makes `OSError.__new__` pick the errno subclass.
+fn map_io_error(error: &std::io::Error, path: &std::path::Path) -> PyErr {
+    PyOSError::new_err((
+        error.raw_os_error(),
+        error.to_string(),
+        path.display().to_string(),
+    ))
+}
+
 fn parse_cell(address: &str) -> PyResult<CellRef> {
     CellRef::parse_a1(address)
         .map_err(|error| RangeError::new_err(format!("invalid cell {address:?}: {error}")))
@@ -72,8 +77,7 @@ fn parse_range(address: &str) -> PyResult<CellRange> {
         .map_err(|error| RangeError::new_err(format!("invalid range {address:?}: {error}")))
 }
 
-/// An Excel error value such as `#DIV/0!`, distinct from a cell holding that
-/// text.
+/// An Excel error value, distinct from a cell holding that text.
 #[pyclass(module = "betteroffice_xlsx", name = "CellError", frozen)]
 pub struct PyCellError {
     #[pyo3(get)]
@@ -99,14 +103,12 @@ impl PyCellError {
             .is_ok_and(|text| text == self.code)
     }
 
-    /// Delegates to the code's `str` hash. `__eq__` accepts a plain `str`, so
-    /// the hashes have to agree or dict and set lookups break.
+    /// Must match `str`'s hash, since `__eq__` accepts one.
     fn __hash__(&self, py: Python<'_>) -> PyResult<isize> {
         self.code.as_str().into_pyobject(py)?.hash()
     }
 }
 
-/// A rendered sheet image.
 #[pyclass(module = "betteroffice_xlsx", name = "Png", frozen)]
 pub struct PyPng {
     data: Vec<u8>,
@@ -124,7 +126,7 @@ impl PyPng {
     }
 
     fn write(&self, path: PathBuf) -> PyResult<()> {
-        fs::write(path, &self.data).map_err(|error| PyOSError::new_err(error.to_string()))
+        fs::write(&path, &self.data).map_err(|error| map_io_error(&error, &path))
     }
 
     fn __len__(&self) -> usize {
@@ -141,7 +143,6 @@ impl PyPng {
     }
 }
 
-/// The result of a recalculation pass.
 #[pyclass(module = "betteroffice_xlsx", name = "Calculation", frozen)]
 pub struct PyCalculation {
     #[pyo3(get)]
@@ -168,8 +169,7 @@ pub struct PyWorkbook {
 }
 
 impl PyWorkbook {
-    /// Parses off the GIL. `data` is copied first because a borrow of a Python
-    /// buffer cannot cross `detach`.
+    /// Copies first: a borrow of a Python buffer cannot cross `detach`.
     fn open_bytes(
         py: Python<'_>,
         data: &[u8],
@@ -185,14 +185,25 @@ impl PyWorkbook {
     }
 
     fn resolve_sheet(&self, key: &Bound<'_, PyAny>) -> PyResult<SheetId> {
+        // bool is an int subclass, so True would otherwise select sheet 1.
+        if key.is_instance_of::<PyBool>() {
+            return Err(PyTypeError::new_err(
+                "sheet must be a name (str) or an index (int), not bool",
+            ));
+        }
         if let Ok(name) = key.extract::<String>() {
             return self
                 .inner
                 .sheet_id(&name)
                 .ok_or_else(|| PyKeyError::new_err(format!("no sheet named {name:?}")));
         }
-        if let Ok(index) = key.extract::<usize>() {
+        if key.is_instance_of::<PyInt>() {
             let count = self.inner.sheet_count();
+            let index = key.extract::<usize>().map_err(|_| {
+                PyIndexError::new_err(format!(
+                    "sheet index {key} out of range for {count} sheet(s)"
+                ))
+            })?;
             if index >= count {
                 return Err(PyIndexError::new_err(format!(
                     "sheet index {index} out of range for {count} sheet(s)"
@@ -208,29 +219,26 @@ impl PyWorkbook {
 
 #[pymethods]
 impl PyWorkbook {
-    /// Open a workbook from bytes without recalculating.
+    /// Keeps the values already cached in the file.
     #[staticmethod]
     fn open(py: Python<'_>, data: &[u8]) -> PyResult<Self> {
         Self::open_bytes(py, data, None)
     }
 
-    /// Open a workbook from a filesystem path.
     #[staticmethod]
     fn open_path(py: Python<'_>, path: PathBuf) -> PyResult<Self> {
-        let data = py.detach(|| fs::read(&path)).map_err(|error| {
-            PyOSError::new_err(format!("could not read {}: {error}", path.display()))
-        })?;
+        let data = py
+            .detach(|| fs::read(&path))
+            .map_err(|error| map_io_error(&error, &path))?;
         Self::open_bytes(py, &data, None)
     }
 
-    /// Open a workbook and recalculate every formula up front.
     #[staticmethod]
     #[pyo3(signature = (data, *, now_serial = None))]
     fn open_recalculated(py: Python<'_>, data: &[u8], now_serial: Option<f64>) -> PyResult<Self> {
         Self::open_bytes(py, data, Some(CalculationOptions { now_serial }))
     }
 
-    /// Recalculate every formula in the workbook.
     #[pyo3(signature = (*, now_serial = None))]
     fn recalculate(&mut self, py: Python<'_>, now_serial: Option<f64>) -> PyCalculation {
         let result = py.detach(|| {
@@ -249,7 +257,6 @@ impl PyWorkbook {
         self.inner.sheet_count()
     }
 
-    /// Resolve a sheet name or index to its positional index.
     fn sheet_index(&self, sheet: &Bound<'_, PyAny>) -> PyResult<usize> {
         self.resolve_sheet(sheet).map(|sheet| sheet.0 as usize)
     }
@@ -266,7 +273,6 @@ impl PyWorkbook {
             .collect()
     }
 
-    /// The calculated value of a cell.
     fn value(
         &self,
         py: Python<'_>,
@@ -298,7 +304,7 @@ impl PyWorkbook {
         }
     }
 
-    /// The source formula of a cell, without the leading `=`, or `None`.
+    /// Source formula without the leading `=`.
     fn formula(&self, sheet: &Bound<'_, PyAny>, address: &str) -> PyResult<Option<String>> {
         let sheet = self.resolve_sheet(sheet)?;
         let cell = parse_cell(address)?;
@@ -306,8 +312,7 @@ impl PyWorkbook {
         Ok(sheet.cell(cell).and_then(|found| found.formula.clone()))
     }
 
-    /// Set a cell from what a user would type. A leading `=` makes it a
-    /// formula. Dependents recalculate. Returns whether anything changed.
+    /// Takes what a user would type; returns whether anything changed.
     #[pyo3(signature = (sheet, address, value, *, now_serial = None))]
     fn set(
         &mut self,
@@ -324,7 +329,6 @@ impl PyWorkbook {
             .map_err(map_error)
     }
 
-    /// Render a sheet to PNG.
     #[pyo3(signature = (sheet, *, scale = 1.0, range = None, max_width = None, max_height = None))]
     fn render_png(
         &self,
@@ -353,17 +357,24 @@ impl PyWorkbook {
         })
     }
 
-    /// Serialize the workbook back to XLSX bytes.
     fn save<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let bytes = py.detach(|| self.inner.save()).map_err(map_error)?;
         Ok(PyBytes::new(py, &bytes))
     }
 
-    /// Serialize the workbook to a filesystem path.
-    fn save_path(&self, path: PathBuf) -> PyResult<()> {
-        let bytes = self.inner.save().map_err(map_error)?;
-        fs::write(&path, bytes).map_err(|error| {
-            PyOSError::new_err(format!("could not write {}: {error}", path.display()))
+    fn save_path(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        enum Failure {
+            Engine(CoreError),
+            Io(std::io::Error),
+        }
+
+        py.detach(|| {
+            let bytes = self.inner.save().map_err(Failure::Engine)?;
+            fs::write(&path, bytes).map_err(Failure::Io)
+        })
+        .map_err(|failure| match failure {
+            Failure::Engine(error) => map_error(error),
+            Failure::Io(error) => map_io_error(&error, &path),
         })
     }
 

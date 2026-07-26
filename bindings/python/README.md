@@ -26,9 +26,13 @@ print(sheet.formula("B3"))    # 'SUM(B1:B2)'
 wb.save_path("budget-out.xlsx")
 ```
 
-Value and formula are separate accessors on purpose. `sheet["B3"]` is always the
-value this engine calculated; `sheet.formula("B3")` is always the source text.
-Nothing is read from the cached values the authoring application left behind.
+Value and formula are separate accessors on purpose: `sheet["B3"]` is the value,
+`sheet.formula("B3")` is the source text. Writing a cell recalculates its
+dependents, so the value above is computed here rather than read back from the
+file.
+
+`Workbook.open` starts from the values the authoring application cached. Reach
+for `open_recalculated` when you do not trust them.
 
 ## Render a sheet to PNG
 

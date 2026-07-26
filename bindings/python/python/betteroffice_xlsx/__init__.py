@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import math
 import os
 from typing import Iterator, Union
 
@@ -189,12 +190,24 @@ def _as_input(value: object) -> str:
         return "TRUE"
     if value is False:
         return "FALSE"
+    if isinstance(value, str):
+        return value
     if isinstance(value, (datetime.date, datetime.time, datetime.timedelta)):
-        # str() would land text that looks like a date but is not one to the
-        # engine. Serial conversion needs the workbook's date system, which is
-        # not exposed yet, so refuse rather than write something wrong.
         raise TypeError(
             f"{type(value).__name__} is not supported yet; write the Excel "
             "serial number as a float, or the text you want with str()"
+        )
+    try:
+        as_float = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        as_float = None
+    except OverflowError:
+        raise ValueError(
+            f"{value!r} is too large for a spreadsheet cell (exceeds float64)"
+        ) from None
+    if as_float is not None and not math.isfinite(as_float):
+        raise ValueError(
+            f"{value!r} is not a finite number and cannot be stored as one; "
+            "pass a string if you want the text"
         )
     return str(value)
