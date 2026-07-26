@@ -63,22 +63,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `smoke` is false wherever the wheel is cross-compiled and therefore
+        # not installable on the runner that built it. macos-latest is arm64,
+        # so its x86_64 wheel is cross-built too.
         include:
           - os: ubuntu-latest
             target: x86_64
             manylinux: "2014"
+            smoke: true
           - os: ubuntu-latest
             target: aarch64
             manylinux: "2014"
+            smoke: false
           - os: macos-latest
             target: aarch64
             manylinux: auto
+            smoke: true
           - os: macos-latest
             target: x86_64
             manylinux: auto
+            smoke: false
           - os: windows-latest
             target: x64
             manylinux: auto
+            smoke: true
     steps:
       - uses: actions/checkout@v7
 
@@ -96,8 +104,7 @@ jobs:
           sccache: "true"
 
       - name: Smoke test the wheel
-        # The cross-compiled aarch64 Linux wheel cannot run on this host.
-        if: "!(matrix.os == 'ubuntu-latest' && matrix.target == 'aarch64')"
+        if: matrix.smoke
         working-directory: bindings/python
         shell: bash
         run: |
