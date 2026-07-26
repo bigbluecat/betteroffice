@@ -168,6 +168,30 @@ def test_workbook_is_usable_from_another_thread(sample_bytes):
     assert results == [pytest.approx(wb.value("Budget", "D3"))]
 
 
+def test_concurrent_renders_are_consistent(sample_bytes):
+    """render_png releases the GIL, so parallel renders must not race."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    wb = bo.Workbook.open(sample_bytes)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: wb.render_png("Budget", range="A1:D12"), range(8)))
+
+    reference = results[0]
+    assert all(png.bytes == reference.bytes for png in results)
+    assert all(png.width == reference.width for png in results)
+
+
+def test_concurrent_opens_are_consistent(sample_bytes):
+    """open parses off the GIL from a copied buffer."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        books = list(pool.map(lambda _: bo.Workbook.open(sample_bytes), range(8)))
+
+    assert all(wb.sheet_names == ["Budget", "Summary", "Styled"] for wb in books)
+    assert all(wb.value("Budget", "D3") == pytest.approx(157.0) for wb in books)
+
+
 def test_render_png(sample_bytes):
     png = bo.Workbook.open(sample_bytes).render_png("Budget", range="A1:D12")
     assert png.bytes[:8] == PNG_MAGIC

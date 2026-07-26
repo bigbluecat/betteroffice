@@ -168,6 +168,22 @@ pub struct PyWorkbook {
 }
 
 impl PyWorkbook {
+    /// Parses off the GIL. `data` is copied first because a borrow of a Python
+    /// buffer cannot cross `detach`.
+    fn open_bytes(
+        py: Python<'_>,
+        data: &[u8],
+        options: Option<CalculationOptions>,
+    ) -> PyResult<Self> {
+        let data = data.to_vec();
+        py.detach(|| match options {
+            Some(options) => CoreWorkbook::open_recalculated(&data, options),
+            None => CoreWorkbook::open(&data),
+        })
+        .map(|inner| Self { inner })
+        .map_err(map_error)
+    }
+
     fn resolve_sheet(&self, key: &Bound<'_, PyAny>) -> PyResult<SheetId> {
         if let Ok(name) = key.extract::<String>() {
             return self
@@ -194,36 +210,33 @@ impl PyWorkbook {
 impl PyWorkbook {
     /// Open a workbook from bytes without recalculating.
     #[staticmethod]
-    fn open(data: &[u8]) -> PyResult<Self> {
-        CoreWorkbook::open(data)
-            .map(|inner| Self { inner })
-            .map_err(map_error)
+    fn open(py: Python<'_>, data: &[u8]) -> PyResult<Self> {
+        Self::open_bytes(py, data, None)
     }
 
     /// Open a workbook from a filesystem path.
     #[staticmethod]
-    fn open_path(path: PathBuf) -> PyResult<Self> {
-        let data = fs::read(&path).map_err(|error| {
+    fn open_path(py: Python<'_>, path: PathBuf) -> PyResult<Self> {
+        let data = py.detach(|| fs::read(&path)).map_err(|error| {
             PyOSError::new_err(format!("could not read {}: {error}", path.display()))
         })?;
-        Self::open(&data)
+        Self::open_bytes(py, &data, None)
     }
 
     /// Open a workbook and recalculate every formula up front.
     #[staticmethod]
     #[pyo3(signature = (data, *, now_serial = None))]
-    fn open_recalculated(data: &[u8], now_serial: Option<f64>) -> PyResult<Self> {
-        CoreWorkbook::open_recalculated(data, CalculationOptions { now_serial })
-            .map(|inner| Self { inner })
-            .map_err(map_error)
+    fn open_recalculated(py: Python<'_>, data: &[u8], now_serial: Option<f64>) -> PyResult<Self> {
+        Self::open_bytes(py, data, Some(CalculationOptions { now_serial }))
     }
 
     /// Recalculate every formula in the workbook.
     #[pyo3(signature = (*, now_serial = None))]
-    fn recalculate(&mut self, now_serial: Option<f64>) -> PyCalculation {
-        let result = self
-            .inner
-            .recalculate_all(CalculationOptions { now_serial });
+    fn recalculate(&mut self, py: Python<'_>, now_serial: Option<f64>) -> PyCalculation {
+        let result = py.detach(|| {
+            self.inner
+                .recalculate_all(CalculationOptions { now_serial })
+        });
         PyCalculation {
             changed: result.changed.len(),
             cycles: result.cycle_cells.len(),
@@ -315,6 +328,7 @@ impl PyWorkbook {
     #[pyo3(signature = (sheet, *, scale = 1.0, range = None, max_width = None, max_height = None))]
     fn render_png(
         &self,
+        py: Python<'_>,
         sheet: &Bound<'_, PyAny>,
         scale: f32,
         range: Option<&str>,
@@ -323,17 +337,14 @@ impl PyWorkbook {
     ) -> PyResult<PyPng> {
         let sheet = self.resolve_sheet(sheet)?;
         let range = range.map(parse_range).transpose()?;
-        let rendered = self
-            .inner
-            .render_sheet(
-                sheet,
-                &RenderOptions {
-                    range,
-                    scale,
-                    max_width,
-                    max_height,
-                },
-            )
+        let options = RenderOptions {
+            range,
+            scale,
+            max_width,
+            max_height,
+        };
+        let rendered = py
+            .detach(|| self.inner.render_sheet(sheet, &options))
             .map_err(map_error)?;
         Ok(PyPng {
             data: rendered.bytes,
@@ -344,7 +355,7 @@ impl PyWorkbook {
 
     /// Serialize the workbook back to XLSX bytes.
     fn save<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = self.inner.save().map_err(map_error)?;
+        let bytes = py.detach(|| self.inner.save()).map_err(map_error)?;
         Ok(PyBytes::new(py, &bytes))
     }
 

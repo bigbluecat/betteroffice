@@ -8,6 +8,14 @@ version = "0.0.1"
 description = "Read, recalculate, render, and write XLSX workbooks. Rust engine, no Excel and no LibreOffice."
 readme = "README.md"
 license = "Apache-2.0"
+# The extension embeds an OFL-licensed font (see THIRD-PARTY-NOTICES.md), whose
+# license text has to travel with the wheel.
+license-files = [
+  "LICENSE",
+  "NOTICE",
+  "THIRD-PARTY-NOTICES.md",
+  "licenses/Carlito-OFL.txt",
+]
 requires-python = ">=3.9"
 authors = [{ name = "OpenOOXML" }]
 keywords = [

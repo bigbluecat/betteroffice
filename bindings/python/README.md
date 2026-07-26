@@ -41,6 +41,9 @@ print(png.width, png.height)
 Rendering is the same grid layout and display list the browser editor uses, so
 server-side output matches what the web canvas paints.
 
+Opening, recalculating, rendering, and saving release the GIL, so they run in
+parallel across threads instead of serializing your workers.
+
 ## Reading without recalculating
 
 `Workbook.open` keeps whatever values the file already carried. Use
@@ -120,6 +123,11 @@ in the Rust engine but are not yet exposed here.
 
 Wheels are built for Linux (x86_64, aarch64), macOS (arm64, x86_64), and Windows
 (x86_64) against the stable ABI for CPython 3.9 and up.
+
+The extension embeds Carlito, a Calibri-metric-compatible face used to measure
+and draw cell text, under the SIL Open Font License. Its license travels with
+the wheel — see `THIRD-PARTY-NOTICES.md` and `licenses/Carlito-OFL.txt`. The
+package's own code is Apache-2.0.
 
 ## Links
 
