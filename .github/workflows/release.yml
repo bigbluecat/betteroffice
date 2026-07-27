@@ -127,10 +127,54 @@ jobs:
         run: gh workflow run deploy.yml --ref main
 
   python-build:
-    name: Python artifacts
+    name: Python wheel (${{ matrix.os }} ${{ matrix.target }})
     needs: release
     if: needs.release.outputs.publishing == 'true'
-    uses: ./.github/workflows/python.yml
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: "2014"
+            sdist: true
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: "2014"
+          - os: macos-latest
+            target: aarch64
+            manylinux: auto
+          - os: macos-latest
+            target: x86_64
+            manylinux: auto
+          - os: windows-latest
+            target: x64
+            manylinux: auto
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          working-directory: bindings/python
+          sccache: "true"
+
+      - uses: PyO3/maturin-action@v1
+        if: matrix.sdist
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: bindings/python
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: bindings/python/dist
 
   python-publish:
     name: Publish to PyPI
