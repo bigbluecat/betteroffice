@@ -4,13 +4,15 @@ name: Publish Python (one-off)
 # the PyPI project exists, which Trusted Publishing requires before it can be
 # configured. Delete this file once betteroffice-xlsx is on PyPI.
 
+# Tag pushes run from the tagged commit, so this works without landing on the
+# default branch the way workflow_dispatch would require.
+#   pypi-dryrun-*   build and check, upload nothing
+#   pypi-publish-*  build, check, then upload
 on:
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Build and check the artifacts without uploading"
-        type: boolean
-        default: true
+  push:
+    tags:
+      - "pypi-dryrun-*"
+      - "pypi-publish-*"
 
 permissions:
   contents: read
@@ -89,7 +91,7 @@ jobs:
           twine check dist/*
 
       - uses: pypa/gh-action-pypi-publish@release/v1
-        if: ${{ !inputs.dry_run }}
+        if: startsWith(github.ref, 'refs/tags/pypi-publish-')
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
           packages-dir: dist
