@@ -31,8 +31,11 @@ Value and formula are separate accessors on purpose: `sheet["B3"]` is the value,
 dependents, so the value above is computed here rather than read back from the
 file.
 
-`Workbook.open` starts from the values the authoring application cached. Reach
-for `open_recalculated` when you do not trust them.
+`Workbook.open` starts from the values the authoring application cached, and a
+cell you have not touched keeps that cached value — including if it was stale
+when the file was written. Use `open_recalculated`, or call `recalculate()`,
+when you need every formula evaluated by this engine rather than trusted from
+the file.
 
 ## Render a sheet to PNG
 
@@ -83,7 +86,7 @@ formulas evaluated or a sheet rasterized, that is the gap this fills.
 | `wb.recalculate()` | re-evaluate; returns a `Calculation` summary |
 | `wb.sheet_names` / `wb.sheet_count` | sheet metadata |
 | `wb[key]` / `wb.sheet(key)` | a `Sheet` by name or index |
-| `sheet[addr]` | calculated value |
+| `sheet[addr]` | cell value — see the note below on when it is recalculated |
 | `sheet[addr] = value` | set from what a user would type |
 | `sheet.formula(addr)` | source formula, or `None` |
 | `wb.render_png(sheet, ...)` | render to PNG |

@@ -148,6 +148,46 @@ def test_non_finite_numbers_are_rejected(sample_bytes):
         sheet["H14"] = 10**400
 
 
+def test_values_whose_text_form_is_not_a_number_are_rejected(sample_bytes):
+    from fractions import Fraction
+
+    sheet = bo.Workbook.open(sample_bytes)["Budget"]
+    with pytest.raises(ValueError, match="serializes to"):
+        sheet["M1"] = Fraction(1, 3)
+    sheet["M1"] = Fraction(3, 1)
+    assert sheet["M1"] == pytest.approx(3.0)
+
+
+def test_untouched_formula_keeps_the_files_cached_value(sample_bytes):
+    """open() trusts the cache; only recalculation re-evaluates."""
+    import io
+    import re
+    import zipfile
+
+    source = bo.Workbook.open(sample_bytes).save()
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(source)) as src, zipfile.ZipFile(
+        out, "w", zipfile.ZIP_DEFLATED
+    ) as dst:
+        for item in src.infolist():
+            blob = src.read(item.filename)
+            if item.filename.endswith("sheet1.xml"):
+                patched, count = re.subn(
+                    r'(<c r="D3"[^>]*>\s*<f>[^<]*</f>\s*<v>)[^<]*(</v>)',
+                    r"\g<1>999\g<2>",
+                    blob.decode(),
+                )
+                if count:
+                    blob = patched.encode()
+            dst.writestr(item, blob)
+    stale = out.getvalue()
+
+    assert bo.Workbook.open(stale).value("Budget", "D3") == pytest.approx(999.0)
+    assert bo.Workbook.open_recalculated(stale).value("Budget", "D3") == pytest.approx(
+        157.0
+    )
+
+
 def test_bool_is_not_a_sheet_index(sample_bytes):
     wb = bo.Workbook.open(sample_bytes)
     for value in (True, False):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import math
+import numbers
 import os
 from typing import Iterator, Union
 
@@ -33,8 +34,9 @@ SheetKey = Union[int, str]
 class Sheet:
     """One sheet, bound to its workbook.
 
-    Indexing reads calculated values; assigning writes what a user would type,
-    so a leading ``=`` makes a formula and dependents recalculate.
+    Assigning writes what a user would type, so a leading ``=`` makes a formula
+    and recalculates its dependents. Indexing reads the current value, which for
+    an untouched cell is whatever the file cached.
     """
 
     __slots__ = ("_index", "_workbook")
@@ -125,7 +127,7 @@ class Workbook:
         return Sheet(self, self._inner.sheet_index(key))
 
     def value(self, sheet: SheetKey, address: str) -> CellValue:
-        """The calculated value of a cell."""
+        """The value of a cell, recalculated only if the workbook has been."""
         return self._inner.value(sheet, address)
 
     def formula(self, sheet: SheetKey, address: str) -> "str | None":
@@ -197,17 +199,21 @@ def _as_input(value: object) -> str:
             f"{type(value).__name__} is not supported yet; write the Excel "
             "serial number as a float, or the text you want with str()"
         )
+    text = str(value)
     try:
-        as_float = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        as_float = float(text)
+    except ValueError:
         as_float = None
-    except OverflowError:
-        raise ValueError(
-            f"{value!r} is too large for a spreadsheet cell (exceeds float64)"
-        ) from None
-    if as_float is not None and not math.isfinite(as_float):
-        raise ValueError(
-            f"{value!r} is not a finite number and cannot be stored as one; "
-            "pass a string if you want the text"
-        )
-    return str(value)
+
+    if isinstance(value, numbers.Number):
+        if as_float is None:
+            raise ValueError(
+                f"{value!r} serializes to {text!r}, which the engine reads as "
+                "text rather than a number; convert it first"
+            )
+        if not math.isfinite(as_float):
+            raise ValueError(
+                f"{value!r} is not a finite number and cannot be stored as one; "
+                "pass a string if you want the text"
+            )
+    return text

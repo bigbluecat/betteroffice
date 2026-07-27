@@ -125,8 +125,9 @@ impl PyPng {
         PyBytes::new(py, &self.data)
     }
 
-    fn write(&self, path: PathBuf) -> PyResult<()> {
-        fs::write(&path, &self.data).map_err(|error| map_io_error(&error, &path))
+    fn write(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        py.detach(|| fs::write(&path, &self.data))
+            .map_err(|error| map_io_error(&error, &path))
     }
 
     fn __len__(&self) -> usize {
