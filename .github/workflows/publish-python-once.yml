@@ -1,0 +1,96 @@
+name: Publish Python (one-off)
+
+# Temporary. Builds the full wheel matrix and publishes the current version so
+# the PyPI project exists, which Trusted Publishing requires before it can be
+# configured. Delete this file once betteroffice-xlsx is on PyPI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and check the artifacts without uploading"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: Wheel (${{ matrix.os }} ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: "2014"
+            sdist: true
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: "2014"
+          - os: macos-latest
+            target: aarch64
+            manylinux: auto
+          - os: macos-latest
+            target: x86_64
+            manylinux: auto
+          - os: windows-latest
+            target: x64
+            manylinux: auto
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          working-directory: bindings/python
+          sccache: "true"
+
+      - uses: PyO3/maturin-action@v1
+        if: matrix.sdist
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: bindings/python
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: bindings/python/dist
+
+  publish:
+    name: Publish to PyPI
+    needs: wheels
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Show what was built
+        run: ls -la dist
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Check the metadata renders
+        run: |
+          python -m pip install --upgrade pip twine
+          twine check dist/*
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        if: ${{ !inputs.dry_run }}
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          packages-dir: dist
+          skip-existing: true
