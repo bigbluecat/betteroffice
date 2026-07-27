@@ -52,7 +52,6 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           working-directory: bindings/python
-          sccache: "true"
 
       - uses: PyO3/maturin-action@v1
         if: matrix.sdist
