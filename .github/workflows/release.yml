@@ -129,8 +129,6 @@ jobs:
   python-build:
     name: Python wheel (${{ matrix.os }} ${{ matrix.target }})
     needs: release
-    # publishing is set before the crates are published, so it stays true if a
-    # later step fails; gate on the job result as well.
     if: needs.release.result == 'success' && needs.release.outputs.publishing == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
