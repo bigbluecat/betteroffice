@@ -316,7 +316,23 @@ where
 }
 
 fn unsupported_family(space: &ChartSpace) -> Option<&str> {
-    let supported = |family: &str| matches!(family, "column" | "bar" | "line" | "pie" | "doughnut");
+    let supported = |family: &str| {
+        matches!(
+            family,
+            "column"
+                | "bar"
+                | "line"
+                | "pie"
+                | "doughnut"
+                | "area"
+                | "scatter"
+                | "bubble"
+                | "radar"
+                | "stock"
+                | "ofPie"
+                | "surface"
+        )
+    };
     if space.plot_groups.is_empty() {
         return (!supported(&space.chart_type)).then_some(space.chart_type.as_str());
     }
@@ -857,7 +873,7 @@ mod tests {
     #[test]
     fn unsupported_families_are_not_substituted() {
         let space = ChartSpace {
-            chart_type: "area".into(),
+            chart_type: "treemap".into(),
             title: None,
             legend: None,
             series: Vec::new(),
@@ -866,6 +882,12 @@ mod tests {
             axis_list: None,
             ..Default::default()
         };
-        assert_eq!(unsupported_family(&space), Some("area"));
+        assert_eq!(unsupported_family(&space), Some("treemap"));
+
+        let area = ChartSpace {
+            chart_type: "area".into(),
+            ..Default::default()
+        };
+        assert_eq!(unsupported_family(&area), None);
     }
 }
