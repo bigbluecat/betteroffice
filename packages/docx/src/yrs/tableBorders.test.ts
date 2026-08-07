@@ -169,6 +169,19 @@ describe('the table border toolbar', () => {
     const { session, parsed } = await griddedTable(52003);
     let saved: Document;
     try {
+      // an inserted table arrives fully gridded, so strip it first: what the
+      // inside-borders button paints is only visible against a bare table, and
+      // the interior edges answer to insideH/insideV rather than to the sides
+      session.setCellBorders(range(0, 0, 1, 1), {
+        top: null,
+        bottom: null,
+        left: null,
+        right: null,
+        insideH: null,
+        insideV: null,
+      });
+      expect(paintedEdges(session, 0, 0)).toEqual({});
+
       session.setCellBorders(range(0, 0, 1, 1), INSIDE_BORDERS);
       expect(Object.keys(paintedEdges(session, 0, 0)).sort()).toEqual(['bottom', 'right']);
       expect(Object.keys(paintedEdges(session, 1, 1)).sort()).toEqual(['left', 'top']);
