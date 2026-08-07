@@ -20,9 +20,13 @@ export interface WasmModule {
   cargoArgs?: string[];
 }
 
+// `source` is what wasm-pack left in target/, `vendored` what was copied into the
+// package. Both are recorded so a target/ restored from a CI cache can be
+// re-vendored — the expensive part is wasm-opt, not the copy.
 interface Stamp {
   key: string;
-  outputs: Record<string, string>;
+  source: Record<string, string>;
+  vendored: Record<string, string>;
 }
 
 const WASM_PACK_VERSION = '0.15.0';
@@ -60,9 +64,14 @@ async function hashTree(hash: Hash, dir: string, prefix: string): Promise<void> 
 }
 
 /** Digest of every input the emitted wasm depends on: the crates, the workspace
- * manifest (release profiles) and these scripts. */
+ * manifest (release profiles), the toolchain and these scripts. */
 async function hashSources(): Promise<string> {
   const hash = createHash('sha256');
+  // `stable` moves, so the toolchain has to be part of the identity.
+  const rustc = spawnSync('rustc', ['-vV'], { encoding: 'utf8' });
+  if (rustc.status !== 0) throw new Error('rustc -vV failed');
+  hash.update(rustc.stdout);
+  hash.update(`${WASM_PACK_VERSION}\0${process.env.RUSTFLAGS ?? ''}\0`);
   for (const file of ['Cargo.toml', 'Cargo.lock']) {
     hash.update(`${file}\0`);
     hash.update(await readFile(resolve(root, file)));
@@ -77,25 +86,22 @@ async function hashSources(): Promise<string> {
   return hash.digest('hex');
 }
 
-function vendored(name: string): string[] {
-  return [`${name}.js`, `${name}.d.ts`, `${name}_bg.wasm`, `${name}_bg.wasm.d.ts`];
-}
-
 async function digest(path: string): Promise<string | null> {
   const bytes = await readFile(path).catch(() => null);
   return bytes ? createHash('sha256').update(bytes).digest('hex') : null;
 }
 
-// The stamp lives under target/ and the vendored .wasm is gitignored, so a
-// target/ restored from a CI cache can outlive the output it describes; hashing
-// the output too keeps the skip from serving a file that is no longer there.
-async function isFresh(stamp: string, key: string, dest: string, name: string): Promise<boolean> {
-  const recorded: Stamp | null = await readFile(stamp, 'utf8')
-    .then((text) => JSON.parse(text))
-    .catch(() => null);
-  if (recorded?.key !== key) return false;
-  for (const file of vendored(name)) {
-    if ((await digest(resolve(dest, file))) !== recorded.outputs[file]) return false;
+async function hashAll(dir: string, files: string[]): Promise<Record<string, string>> {
+  const hashes: Record<string, string> = {};
+  for (const file of files) hashes[file] = (await digest(resolve(dir, file))) as string;
+  return hashes;
+}
+
+async function intact(dir: string, expected: Record<string, string> | undefined): Promise<boolean> {
+  const entries = Object.entries(expected ?? {});
+  if (entries.length === 0) return false;
+  for (const [file, hash] of entries) {
+    if ((await digest(resolve(dir, file))) !== hash) return false;
   }
   return true;
 }
@@ -107,37 +113,46 @@ export async function buildWasmModules(modules: WasmModule[]): Promise<void> {
 
   for (const { crate, name, generated, cargoArgs = [] } of modules) {
     const dest = resolve(root, generated);
+    const output = resolve(root, 'target/wasm-pack', crate);
     const stamp = resolve(root, 'target/wasm-pack', `${crate}.json`);
+    const files = [`${name}.js`, `${name}.d.ts`, `${name}_bg.wasm`, `${name}_bg.wasm.d.ts`];
     const key = createHash('sha256')
       .update(sources)
-      .update(`\0${WASM_PACK_VERSION}\0${crate}\0${name}\0${cargoArgs.join(' ')}`)
+      .update(`\0${crate}\0${name}\0${cargoArgs.join(' ')}`)
       .digest('hex');
 
-    if (await isFresh(stamp, key, dest, name)) {
+    const recorded: Stamp | null = await readFile(stamp, 'utf8')
+      .then((text) => JSON.parse(text))
+      .catch(() => null);
+    const current = recorded?.key === key;
+    if (current && (await intact(dest, recorded?.vendored))) {
       console.log(`[wasm] ${crate}: up to date`);
       continue;
     }
 
-    const output = resolve(root, 'target/wasm-pack', crate);
-    await rm(output, { recursive: true, force: true });
-    // --locked must ride with the cargo pass-through: wasm-pack forwards its own
-    // trailing args verbatim once a `--` section exists, and cargo rejects a
-    // stray `--` marker.
-    const build = spawnSync(
-      'wasm-pack',
-      [
-        'build',
-        resolve(root, 'crates', crate),
-        '--release',
-        '--target',
-        'web',
-        '--out-dir',
-        output,
-        ...(cargoArgs.length ? ['--', ...cargoArgs] : ['--locked']),
-      ],
-      { stdio: 'inherit' }
-    );
-    if (build.status !== 0) process.exit(build.status ?? 1);
+    if (current && (await intact(output, recorded?.source))) {
+      console.log(`[wasm] ${crate}: vendoring the cached build`);
+    } else {
+      await rm(output, { recursive: true, force: true });
+      // --locked must ride with the cargo pass-through: wasm-pack forwards its
+      // own trailing args verbatim once a `--` section exists, and cargo rejects
+      // a stray `--` marker.
+      const build = spawnSync(
+        'wasm-pack',
+        [
+          'build',
+          resolve(root, 'crates', crate),
+          '--release',
+          '--target',
+          'web',
+          '--out-dir',
+          output,
+          ...(cargoArgs.length ? ['--', ...cargoArgs] : ['--locked']),
+        ],
+        { stdio: 'inherit' }
+      );
+      if (build.status !== 0) process.exit(build.status ?? 1);
+    }
 
     await mkdir(dest, { recursive: true });
     const glue = await readFile(resolve(output, `${name}.js`), 'utf8');
@@ -147,15 +162,18 @@ export async function buildWasmModules(modules: WasmModule[]): Promise<void> {
       resolve(dest, `${name}.js`),
       glue.replace(fallback, `throw new Error('${crate} requires an explicit module or URL');`)
     );
-    for (const file of [`${name}.d.ts`, `${name}_bg.wasm`, `${name}_bg.wasm.d.ts`]) {
+    for (const file of files.filter((file) => file !== `${name}.js`)) {
       await copyFile(resolve(output, file), resolve(dest, file));
     }
 
-    const outputs: Record<string, string> = {};
-    for (const file of vendored(name)) {
-      outputs[file] = (await digest(resolve(dest, file))) as string;
-    }
     await mkdir(dirname(stamp), { recursive: true });
-    await writeFile(stamp, JSON.stringify({ key, outputs } satisfies Stamp));
+    await writeFile(
+      stamp,
+      JSON.stringify({
+        key,
+        source: await hashAll(output, files),
+        vendored: await hashAll(dest, files),
+      } satisfies Stamp)
+    );
   }
 }

@@ -26,7 +26,9 @@ async function readTargets(): Promise<Target[]> {
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const dir = resolve(packages, entry.name);
-    const manifest = JSON.parse(await readFile(resolve(dir, 'package.json'), 'utf8'));
+    const packaged = await readFile(resolve(dir, 'package.json'), 'utf8').catch(() => null);
+    if (!packaged) continue;
+    const manifest = JSON.parse(packaged);
     if (!manifest.scripts?.build) continue;
     const deps = Object.entries<string>(manifest.dependencies ?? {})
       .filter(([, range]) => range.startsWith('workspace:'))
@@ -79,12 +81,15 @@ async function hashInputs(dir: string): Promise<string> {
 const targets = order(await readTargets());
 const keys = new Map<string, string>();
 
-for (const target of targets) {
-  const inputs = await hashInputs(target.dir);
-  const key = createHash('sha256')
-    .update(inputs)
+async function keyOf(target: Target): Promise<string> {
+  return createHash('sha256')
+    .update(await hashInputs(target.dir))
     .update(target.deps.map((dep) => keys.get(dep) ?? '').join('\0'))
     .digest('hex');
+}
+
+for (const target of targets) {
+  const key = await keyOf(target);
   keys.set(target.name, key);
 
   const stamp = resolve(target.dir, 'dist', STAMP);
@@ -100,5 +105,10 @@ for (const target of targets) {
     stdio: 'inherit',
   });
   if (build.status !== 0) process.exit(build.status ?? 1);
-  await writeFile(stamp, key);
+
+  // The wasm builds vendor their output back into the hashed tree, so a key
+  // taken beforehand never matches again; stamp the tree as it settled.
+  const settled = await keyOf(target);
+  keys.set(target.name, settled);
+  await writeFile(stamp, settled);
 }

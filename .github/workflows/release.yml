@@ -59,9 +59,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install wasm-pack
+      - uses: taiki-e/install-action@v2
         if: steps.pending.outputs.publishing == 'true'
-        run: cargo install wasm-pack --version 0.15.0 --locked
+        with:
+          tool: wasm-pack@0.15.0
 
       - name: Type check
         if: steps.pending.outputs.publishing == 'true'
