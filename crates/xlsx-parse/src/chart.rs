@@ -294,7 +294,9 @@ pub(crate) fn parse_sheet_charts(
     Ok(charts)
 }
 
-/// Every drawing part a sheet relates to, with its bytes.
+/// Every drawing part a sheet relates to, with its bytes. A part two
+/// relationships both name is one drawing, and following it twice would emit
+/// every anchor twice, so it is walked once.
 fn sheet_drawings<'a>(
     parts: &'a [(String, Vec<u8>)],
     sheet_path: &str,
@@ -303,12 +305,15 @@ fn sheet_drawings<'a>(
         return Ok(Vec::new());
     };
     let sheet_dir = directory_of(sheet_path);
-    let mut drawings = Vec::new();
+    let mut drawings: Vec<(String, &[u8])> = Vec::new();
     for (_, _, target) in parse_relationships(rels)?
         .iter()
         .filter(|(_, kind, _)| type_is(kind, TYPE_DRAWING))
     {
         let path = resolve_part_path(sheet_dir, target);
+        if drawings.iter().any(|(walked, _)| *walked == path) {
+            continue;
+        }
         if let Some(bytes) = find_part(parts, &path) {
             drawings.push((path, bytes));
         }

@@ -1425,12 +1425,13 @@ impl Workbook {
         Ok(chart_at_point(&regions, x, y).cloned())
     }
 
-    /// Slide a chart by `dx`/`dy` content pixels, clamped to the grid. One undo
-    /// step; the new anchor is written back on save.
+    /// Slide the chart frame `frame` names — a `ChartRegion` id — by `dx`/`dy`
+    /// content pixels, clamped to the grid. One undo step; the new anchor is
+    /// written back on save.
     pub fn move_chart(
         &mut self,
         sheet: SheetId,
-        part: &str,
+        frame: &str,
         dx: f32,
         dy: f32,
         options: CalculationOptions,
@@ -1439,26 +1440,26 @@ impl Workbook {
         let chart = sheet_ref
             .charts
             .iter()
-            .find(|chart| chart.part == part)
-            .ok_or_else(|| {
-                Error::InvalidOperation(format!("no chart on this sheet is backed by {part}"))
-            })?;
-        let anchor = moved_chart_anchor(
-            chart.anchor,
+            .find(|chart| chart.frame_id() == frame)
+            .ok_or_else(|| chart_frame_not_found(frame))?;
+        let from = chart.anchor;
+        let to = moved_chart_anchor(
+            from,
             &GridGeometry::new(sheet_ref),
             f64::from(dx),
             f64::from(dy),
         )
         .ok_or_else(|| {
             Error::InvalidOperation(format!(
-                "chart {part} is pinned to the sheet and cannot be moved"
+                "chart {frame} is pinned to the sheet and cannot be moved"
             ))
         })?;
         self.apply_ops(
             vec![Op::SetChartAnchor {
                 sheet,
-                part: part.to_owned(),
-                anchor,
+                frame: frame.to_owned(),
+                from,
+                to,
             }],
             options,
         )
@@ -2295,19 +2296,23 @@ fn validate_op(model: &WorkbookModel, op: &Op) -> Result<()> {
         }
         Op::SetChartAnchor {
             sheet,
-            part,
-            anchor,
+            frame,
+            from,
+            to,
         } => {
             let sheet_ref = require_sheet(model, *sheet)?;
             let chart = sheet_ref
                 .charts
                 .iter()
-                .find(|chart| chart.part == *part)
-                .ok_or_else(|| {
-                    Error::InvalidOperation(format!("no chart on this sheet is backed by {part}"))
-                })?;
-            validate_anchor_change(chart.anchor, *anchor, part)?;
-            resolve_chart_anchor(*anchor, &GridGeometry::new(sheet_ref), 0, 0)
+                .find(|chart| chart.frame_id() == *frame)
+                .ok_or_else(|| chart_frame_not_found(frame))?;
+            if chart.anchor != *from {
+                return Err(Error::InvalidOperation(format!(
+                    "chart frame {frame} does not hold the anchor this op was recorded against; its drawing has changed"
+                )));
+            }
+            validate_anchor_change(*from, *to, frame)?;
+            resolve_chart_anchor(*to, &GridGeometry::new(sheet_ref), 0, 0)
                 .map_err(|error| Error::InvalidOperation(error.to_string()))?;
         }
         Op::MergeCells { sheet, range } | Op::UnmergeCells { sheet, range } => {
@@ -2507,9 +2512,9 @@ fn validate_charts(charts: &[SheetChart]) -> Result<()> {
                 "chart anchor index is out of range".to_string(),
             ));
         }
-        if !identities.insert((&chart.part, &chart.drawing, chart.anchor_index)) {
+        if !identities.insert((&chart.drawing, chart.anchor_index)) {
             return Err(Error::InvalidOperation(
-                "two charts claim the same part, drawing and anchor".to_string(),
+                "two charts claim the same drawing anchor".to_string(),
             ));
         }
         validate_chart_anchor(chart.anchor)?;
@@ -2529,6 +2534,10 @@ fn validate_charts(charts: &[SheetChart]) -> Result<()> {
     Ok(())
 }
 
+fn chart_frame_not_found(frame: &str) -> Error {
+    Error::InvalidOperation(format!("no chart frame on this sheet is named {frame}"))
+}
+
 /// Exactly what a save can express when a chart's anchor changes, so an op is
 /// refused here rather than written back with part of it dropped. A save writes
 /// a grid-anchored marker whole, cell and offset alike, so both corners of a
@@ -2536,7 +2545,7 @@ fn validate_charts(charts: &[SheetChart]) -> Result<()> {
 /// size lives in `xdr:ext`, which is never patched, so only its corner moves.
 /// An absolute anchor carries its position in attributes the writer cannot
 /// rewrite, and no anchor may change kind, which would rename the element.
-fn validate_anchor_change(authored: ChartAnchor, moved: ChartAnchor, part: &str) -> Result<()> {
+fn validate_anchor_change(authored: ChartAnchor, moved: ChartAnchor, frame: &str) -> Result<()> {
     match (authored, moved) {
         (
             ChartAnchor::TwoCell { edit_as, .. },
@@ -2554,17 +2563,17 @@ fn validate_anchor_change(authored: ChartAnchor, moved: ChartAnchor, part: &str)
         ) if extent == moved_extent => Ok(()),
         (ChartAnchor::Absolute { .. }, _) | (_, ChartAnchor::Absolute { .. }) => {
             Err(Error::InvalidOperation(format!(
-                "chart {part} is pinned to the sheet and cannot be moved"
+                "chart {frame} is pinned to the sheet and cannot be moved"
             )))
         }
         (ChartAnchor::TwoCell { .. }, ChartAnchor::TwoCell { .. }) => Err(Error::InvalidOperation(
-            format!("chart {part} cannot change how it follows a grid edit"),
+            format!("chart {frame} cannot change how it follows a grid edit"),
         )),
         (ChartAnchor::OneCell { .. }, ChartAnchor::OneCell { .. }) => Err(Error::InvalidOperation(
-            format!("chart {part} cannot be resized: a one-cell extent is not written back"),
+            format!("chart {frame} cannot be resized: a one-cell extent is not written back"),
         )),
         _ => Err(Error::InvalidOperation(format!(
-            "chart {part} cannot change its anchor kind"
+            "chart {frame} cannot change its anchor kind"
         ))),
     }
 }

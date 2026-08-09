@@ -506,16 +506,7 @@ fn patch_chart_parts(
             .map(|sheet| sheet.charts.as_slice())
             .unwrap_or_default();
         for chart in &sheet.charts {
-            let original = source
-                .iter()
-                .find(|other| other.part == chart.part)
-                .ok_or_else(|| unwritable_chart(&chart.part, &sheet.name))?;
-            if original.drawing != chart.drawing || original.anchor_index != chart.anchor_index {
-                return Err(ParseError::UnsupportedEdit(format!(
-                    "chart {} no longer names the drawing and anchor it was read from",
-                    chart.part
-                )));
-            }
+            let original = source_chart(source, chart, &sheet.name)?;
             if original.refs.len() != chart.refs.len()
                 || original
                     .refs
@@ -698,9 +689,10 @@ fn ensure_preserved_references_stay_valid(
 }
 
 /// This crate patches chart parts in place; it can neither create one nor
-/// delete one. Every chart a retained sheet carries must therefore name
-/// exactly one chart the same source sheet was read with, and every chart that
-/// source held must still be there.
+/// delete one. Every chart frame a retained sheet carries must therefore name
+/// exactly one frame the same source sheet was read with, and every frame that
+/// source held must still be there. Frames, not parts: two anchors may share
+/// one chart part, and each of them is written back on its own.
 fn ensure_chart_provenance(
     wb: &Workbook,
     package: &PreservedPackage,
@@ -712,25 +704,55 @@ fn ensure_chart_provenance(
             .map(|sheet| sheet.charts.as_slice())
             .unwrap_or_default();
         for chart in &sheet.charts {
-            if source
-                .iter()
-                .filter(|other| other.part == chart.part)
-                .count()
-                != 1
-            {
-                return Err(unwritable_chart(&chart.part, &sheet.name));
-            }
+            source_chart(source, chart, &sheet.name)?;
         }
         for original in source {
-            if !sheet.charts.iter().any(|chart| chart.part == original.part) {
-                return Err(ParseError::UnsupportedEdit(format!(
-                    "chart {} was dropped from sheet {}, and this crate cannot delete one",
-                    original.part, sheet.name
-                )));
+            match sheet
+                .charts
+                .iter()
+                .filter(|chart| chart.is_same_frame(original))
+                .count()
+            {
+                1 => {}
+                0 => {
+                    return Err(ParseError::UnsupportedEdit(format!(
+                        "chart {} was dropped from sheet {}, and this crate cannot delete one",
+                        original.part, sheet.name
+                    )));
+                }
+                _ => {
+                    return Err(ParseError::UnsupportedEdit(format!(
+                        "sheet {} carries the anchor holding chart {} twice, and one anchor cannot hold two",
+                        sheet.name, original.part
+                    )));
+                }
             }
         }
     }
     Ok(())
+}
+
+/// The source frame a modelled one must be patched from: same drawing anchor,
+/// same chart part. A frame that repointed either has no source to patch, and
+/// patching the one it used to hold would rewrite somebody else's chart.
+fn source_chart<'a>(
+    source: &'a [SheetChart],
+    chart: &SheetChart,
+    sheet: &str,
+) -> Result<&'a SheetChart, ParseError> {
+    let mut frames = source
+        .iter()
+        .filter(|other| other.is_same_frame(chart) && other.part == chart.part);
+    match (frames.next(), frames.next()) {
+        (Some(original), None) => Ok(original),
+        (None, _) if source.iter().any(|other| other.part == chart.part) => {
+            Err(ParseError::UnsupportedEdit(format!(
+                "chart {} no longer names the drawing and anchor it was read from",
+                chart.part
+            )))
+        }
+        _ => Err(unwritable_chart(&chart.part, sheet)),
+    }
 }
 
 /// The relationship ids a worksheet's `<hyperlink>` elements point at, beside

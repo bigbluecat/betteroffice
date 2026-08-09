@@ -2174,6 +2174,130 @@ fn refuses_a_chart_that_no_longer_names_its_source_anchor() {
     }
 }
 
+/// A drawing may anchor one chart part twice, so a part names no single frame.
+/// Each anchor is written back on its own, and a frame the source never held
+/// is still refused, because this crate cannot create one.
+#[test]
+fn writes_each_anchor_of_a_twice_anchored_chart_part() {
+    let mut source = charted_package();
+    set_part(&mut source, "xl/drawings/drawing1.xml", TWIN_DRAWING);
+    let parsed = parse_workbook_with_package(&source).unwrap();
+    let charts = &parsed.workbook.sheets[0].charts;
+    assert_eq!(charts.len(), 2);
+    assert_eq!(charts[0].part, charts[1].part);
+    assert_eq!((charts[0].anchor_index, charts[1].anchor_index), (0, 1));
+
+    let mut workbook = parsed.workbook.clone();
+    edit_a1(&mut workbook, 1.0);
+    let xlsx_model::ChartAnchor::TwoCell { from, to, edit_as } =
+        workbook.sheets[0].charts[1].anchor
+    else {
+        panic!("two-cell anchor");
+    };
+    workbook.sheets[0].charts[1].anchor = xlsx_model::ChartAnchor::TwoCell {
+        from: xlsx_model::AnchorCell {
+            row: from.row + 3,
+            ..from
+        },
+        to: xlsx_model::AnchorCell {
+            row: to.row + 3,
+            ..to
+        },
+        edit_as,
+    };
+    let saved = crate::serialize_workbook_with_package_and_origins_after_edits(
+        &workbook,
+        &parsed.package,
+        &[Some(0), Some(1)],
+        &vec![SharedStringCells::new(); 2],
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(part_bytes(&saved, "xl/drawings/drawing1.xml")).unwrap(),
+        String::from_utf8(TWIN_DRAWING.to_vec())
+            .unwrap()
+            .replace("<xdr:row>30</xdr:row>", "<xdr:row>33</xdr:row>")
+            .replace("<xdr:row>40</xdr:row>", "<xdr:row>43</xdr:row>"),
+        "the twin anchor is written back and the first one is left alone"
+    );
+
+    let mut duplicated = parsed.workbook.clone();
+    let mut extra = duplicated.sheets[0].charts[0].clone();
+    extra.anchor_index = 5;
+    duplicated.sheets[0].charts.push(extra);
+    let error = crate::serialize_workbook_with_package_and_origins_after_edits(
+        &duplicated,
+        &parsed.package,
+        &[Some(0), Some(1)],
+        &vec![SharedStringCells::new(); 2],
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, ParseError::UnsupportedEdit(message)
+            if message.contains("drawing and anchor it was read from")),
+        "{error:?}"
+    );
+}
+
+/// A worksheet may reach one drawing through more than one relationship. It is
+/// still one drawing: following each relationship on its own would emit every
+/// anchor twice, and the twins would then share an ordinal and address each
+/// other. The parser is the only guard direct users of this crate get.
+#[test]
+fn follows_a_drawing_named_by_two_relationships_once() {
+    let mut source = charted_package();
+    set_part(
+        &mut source,
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdDrawing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/><Relationship Id="rIdDrawingAgain" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#,
+    );
+    let charts = &parse_workbook_with_package(&source)
+        .unwrap()
+        .workbook
+        .sheets[0]
+        .charts;
+    assert_eq!(charts.len(), 1);
+    assert_eq!(charts[0].anchor_index, 0);
+}
+
+/// One drawing anchor cannot hold two frames, so a model carrying one source
+/// frame twice has nothing to write back: the pair would collapse into one on
+/// reopen. The save is refused instead.
+#[test]
+fn refuses_a_chart_frame_a_sheet_carries_twice() {
+    let parsed = parse_workbook_with_package(&charted_package()).unwrap();
+    let mut duplicated = parsed.workbook.clone();
+    let twin = duplicated.sheets[0].charts[0].clone();
+    duplicated.sheets[0].charts.push(twin);
+    let error = crate::serialize_workbook_with_package_and_origins_after_edits(
+        &duplicated,
+        &parsed.package,
+        &[Some(0), Some(1)],
+        &vec![SharedStringCells::new(); 2],
+        SaveEdits {
+            changed: true,
+            moved_references: false,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, ParseError::UnsupportedEdit(message)
+            if message.contains("twice")),
+        "{error:?}"
+    );
+}
+
+/// `DRAWING` with a second anchor on the same chart relationship.
+const TWIN_DRAWING: &[u8] = br#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>2</xdr:col><xdr:colOff>12700</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>8</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>19</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rIdChart"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor><xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>2</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>30</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>8</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>40</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rIdChart"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#;
+
 /// This crate patches chart parts in place, so it can neither create one nor
 /// delete one. A chart that appeared on a sheet, one that vanished from a
 /// retained sheet and one carried onto a sheet with no source are all refused.

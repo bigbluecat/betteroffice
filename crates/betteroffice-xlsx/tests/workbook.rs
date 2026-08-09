@@ -3424,6 +3424,40 @@ fn cross_sheet_charted_fixture() -> Vec<u8> {
     ooxml_opc::rezip_parts(&parts).unwrap()
 }
 
+/// The charted fixture with a second anchor in the same drawing pointing at
+/// the same chart part, so one part backs two frames on one sheet.
+fn twin_anchor_charted_fixture() -> Vec<u8> {
+    let mut parts = ooxml_opc::unzip_parts(&charted_fixture()).unwrap();
+    let drawing = test_part_text(&parts, "xl/drawings/drawing1.xml").replace(
+        "</xdr:wsDr>",
+        r#"<xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>9</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>4</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>12</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>10</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rIdChartTwin"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#,
+    );
+    set_test_part(&mut parts, "xl/drawings/drawing1.xml", drawing.into_bytes());
+    let rels = test_part_text(&parts, "xl/drawings/_rels/drawing1.xml.rels").replace(
+        "</Relationships>",
+        r#"<Relationship Id="rIdChartTwin" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#,
+    );
+    set_test_part(
+        &mut parts,
+        "xl/drawings/_rels/drawing1.xml.rels",
+        rels.into_bytes(),
+    );
+    ooxml_opc::rezip_parts(&parts).unwrap()
+}
+
+/// The twin-anchor fixture with a plain shape anchored ahead of both charts,
+/// as another editor would leave it. Every chart ordinal shifts by one.
+fn shifted_twin_anchor_charted_fixture() -> Vec<u8> {
+    let mut parts = ooxml_opc::unzip_parts(&twin_anchor_charted_fixture()).unwrap();
+    let drawing = test_part_text(&parts, "xl/drawings/drawing1.xml").replacen(
+        "<xdr:twoCellAnchor",
+        r#"<xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>1</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:sp/><xdr:clientData/></xdr:twoCellAnchor><xdr:twoCellAnchor"#,
+        1,
+    );
+    set_test_part(&mut parts, "xl/drawings/drawing1.xml", drawing.into_bytes());
+    ooxml_opc::rezip_parts(&parts).unwrap()
+}
+
 fn chart_formulas(workbook: &Workbook) -> Vec<String> {
     workbook.model().sheets[0].charts[0]
         .refs
@@ -4241,16 +4275,24 @@ fn refuses_chart_state_the_writer_could_not_express() {
         );
     }
 
-    let mut model = charted_model(sample_chart());
-    model.sheets[0].charts.push(sample_chart());
-    let Err(error) = Workbook::from_model(model) else {
-        panic!("two charts on one anchor must be refused");
-    };
-    assert!(
-        matches!(&error, Error::InvalidOperation(message)
-            if message.contains("same part, drawing and anchor")),
-        "{error:?}"
-    );
+    // a frame is addressed by its drawing anchor, so two charts on one anchor
+    // are refused even when they name different parts.
+    for twin in [sample_chart(), {
+        let mut other = sample_chart();
+        other.part = "xl/charts/chart2.xml".to_owned();
+        other
+    }] {
+        let mut model = charted_model(sample_chart());
+        model.sheets[0].charts.push(twin);
+        let Err(error) = Workbook::from_model(model) else {
+            panic!("two charts on one anchor must be refused");
+        };
+        assert!(
+            matches!(&error, Error::InvalidOperation(message)
+                if message.contains("same drawing anchor")),
+            "{error:?}"
+        );
+    }
 }
 
 /// Chart parts come out of the package a workbook was opened with, and this
@@ -4410,7 +4452,7 @@ fn a_point_over_a_chart_resolves_to_it_and_a_point_beside_it_does_not() {
     let anchored = workbook.chart_at_point(&viewport, 300.0, 150.0).unwrap();
     assert_eq!(
         anchored.map(|chart| chart.id),
-        Some("xl/charts/chart1.xml".to_owned())
+        Some("xl/drawings/drawing1.xml#0".to_owned())
     );
     assert_eq!(workbook.chart_at_point(&viewport, 4.0, 4.0).unwrap(), None);
     assert_eq!(
@@ -4471,6 +4513,153 @@ fn a_moved_chart_survives_a_save_and_undoes_in_one_step() {
     assert_eq!(workbook.model().sheets[0].charts[0].anchor, moved);
 }
 
+/// One chart part can back two anchors on a sheet, so a part cannot name a
+/// frame. Each frame hit-tests to its own id, moves alone, and reaches the
+/// anchor it was read from on save.
+#[test]
+fn twin_anchors_on_one_chart_part_move_independently() {
+    let mut workbook = Workbook::open(&twin_anchor_charted_fixture()).unwrap();
+    let charts = &workbook.model().sheets[0].charts;
+    assert_eq!(charts.len(), 2);
+    assert_eq!(charts[0].part, charts[1].part);
+    let before = [charts[0].anchor, charts[1].anchor];
+    let viewport = Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+
+    let left = workbook
+        .chart_at_point(&viewport, 300.0, 150.0)
+        .unwrap()
+        .expect("the fixture anchors a frame under this point");
+    let right = workbook
+        .chart_at_point(&viewport, 620.0, 100.0)
+        .unwrap()
+        .expect("the fixture anchors a second frame under this point");
+    assert_ne!(
+        left.id, right.id,
+        "two frames backed by one part must not share an id"
+    );
+
+    assert!(
+        workbook
+            .move_chart(
+                SheetId(0),
+                &right.id,
+                70.0,
+                45.0,
+                CalculationOptions::default()
+            )
+            .unwrap()
+            .applied
+    );
+    let moved = [
+        workbook.model().sheets[0].charts[0].anchor,
+        workbook.model().sheets[0].charts[1].anchor,
+    ];
+    assert_eq!(
+        moved[0], before[0],
+        "the frame that was not dragged must stay where it was"
+    );
+    assert_ne!(moved[1], before[1], "the dragged frame must have moved");
+
+    let reopened = Workbook::open(&workbook.save().unwrap()).unwrap();
+    assert_eq!(
+        reopened.model().sheets[0]
+            .charts
+            .iter()
+            .map(|chart| chart.anchor)
+            .collect::<Vec<_>>(),
+        moved
+    );
+}
+
+/// An anchor ordinal names a position in a drawing, not an object, so an op
+/// stored against one outlives the structure it was recorded against. A move
+/// replayed onto a drawing that has since gained an anchor must be refused,
+/// never quietly landed on whichever frame now sits at that ordinal.
+#[test]
+fn a_stored_chart_move_refuses_a_drawing_whose_anchors_shifted() {
+    let stored = {
+        let workbook = Workbook::open(&twin_anchor_charted_fixture()).unwrap();
+        let charts = &workbook.model().sheets[0].charts;
+        let right = &charts[1];
+        assert_eq!(right.frame_id(), "xl/drawings/drawing1.xml#1");
+        Op::SetChartAnchor {
+            sheet: SheetId(0),
+            frame: right.frame_id(),
+            from: right.anchor,
+            to: nudged_anchor(right.anchor),
+        }
+    };
+
+    let mut shifted = Workbook::open(&shifted_twin_anchor_charted_fixture()).unwrap();
+    let before = shifted.model().sheets[0]
+        .charts
+        .iter()
+        .map(|chart| (chart.frame_id(), chart.anchor))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        before.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["xl/drawings/drawing1.xml#1", "xl/drawings/drawing1.xml#2"],
+        "the inserted shape must shift both chart ordinals"
+    );
+
+    let error = shifted
+        .apply_ops(vec![stored.clone()], CalculationOptions::default())
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::InvalidOperation(message)
+            if message.contains("xl/drawings/drawing1.xml#1")),
+        "{error:?}"
+    );
+    assert_eq!(
+        shifted.model().sheets[0]
+            .charts
+            .iter()
+            .map(|chart| (chart.frame_id(), chart.anchor))
+            .collect::<Vec<_>>(),
+        before,
+        "a refused replay must leave every anchor alone"
+    );
+
+    // the same op against the drawing it was recorded on still lands.
+    let mut unshifted = Workbook::open(&twin_anchor_charted_fixture()).unwrap();
+    let untouched = unshifted.model().sheets[0].charts[0].anchor;
+    assert!(
+        unshifted
+            .apply_ops(vec![stored], CalculationOptions::default())
+            .unwrap()
+            .applied
+    );
+    assert_eq!(unshifted.model().sheets[0].charts[0].anchor, untouched);
+    assert_ne!(
+        unshifted.model().sheets[0].charts[1].anchor,
+        before[1].1,
+        "the frame the op named must have moved"
+    );
+}
+
+/// The same anchor one row down.
+fn nudged_anchor(anchor: ChartAnchor) -> ChartAnchor {
+    match anchor {
+        ChartAnchor::TwoCell { from, to, edit_as } => ChartAnchor::TwoCell {
+            from: AnchorCell {
+                row: from.row + 1,
+                ..from
+            },
+            to: AnchorCell {
+                row: to.row + 1,
+                ..to
+            },
+            edit_as,
+        },
+        other => other,
+    }
+}
+
 /// A drawing that omitted `colOff`/`rowOff` reads as zero, so a sub-cell move
 /// has no span to write into. The save must not report success while dropping
 /// the offsets — the reopened anchor has to match what the move produced.
@@ -4488,7 +4677,7 @@ fn a_sub_cell_move_survives_a_drawing_that_wrote_no_offsets() {
     workbook
         .move_chart(
             SheetId(0),
-            "xl/charts/chart1.xml",
+            "xl/drawings/drawing1.xml#0",
             17.0,
             9.0,
             CalculationOptions::default(),
@@ -4505,9 +4694,9 @@ fn a_sub_cell_move_survives_a_drawing_that_wrote_no_offsets() {
 }
 
 /// A chart pinned to the sheet cannot be moved, because a save cannot rewrite
-/// the attributes that carry its position; an unknown part names nothing.
+/// the attributes that carry its position; an unknown frame names nothing.
 #[test]
-fn moving_refuses_an_absolute_anchor_and_an_unknown_part() {
+fn moving_refuses_an_absolute_anchor_and_an_unknown_frame() {
     let mut parts = ooxml_opc::unzip_parts(&charted_fixture()).unwrap();
     let drawing = String::from_utf8(CHART_DRAWING.to_vec())
         .unwrap()
@@ -4521,7 +4710,7 @@ fn moving_refuses_an_absolute_anchor_and_an_unknown_part() {
     let error = workbook
         .move_chart(
             SheetId(0),
-            "xl/charts/chart1.xml",
+            "xl/drawings/drawing1.xml#0",
             10.0,
             10.0,
             CalculationOptions::default(),
@@ -4535,14 +4724,15 @@ fn moving_refuses_an_absolute_anchor_and_an_unknown_part() {
     let error = workbook
         .move_chart(
             SheetId(0),
-            "xl/charts/nope.xml",
+            "xl/drawings/drawing1.xml#7",
             10.0,
             10.0,
             CalculationOptions::default(),
         )
         .unwrap_err();
     assert!(
-        matches!(&error, Error::InvalidOperation(message) if message.contains("nope.xml")),
+        matches!(&error, Error::InvalidOperation(message)
+            if message.contains("xl/drawings/drawing1.xml#7")),
         "{error:?}"
     );
 }
@@ -4552,12 +4742,14 @@ fn moving_refuses_an_absolute_anchor_and_an_unknown_part() {
 #[test]
 fn set_chart_anchor_refuses_what_a_save_cannot_write() {
     let mut workbook = Workbook::open(&charted_fixture()).unwrap();
-    let repin = |workbook: &mut Workbook, anchor| {
+    let repin = |workbook: &mut Workbook, to| {
+        let from = workbook.model().sheets[0].charts[0].anchor;
         workbook.apply_ops(
             vec![Op::SetChartAnchor {
                 sheet: SheetId(0),
-                part: "xl/charts/chart1.xml".to_owned(),
-                anchor,
+                frame: "xl/drawings/drawing1.xml#0".to_owned(),
+                from,
+                to,
             }],
             CalculationOptions::default(),
         )
@@ -4626,7 +4818,7 @@ fn collaborative_sessions_refuse_a_chart_move() {
     let error = workbook
         .move_chart(
             SheetId(0),
-            "xl/charts/chart1.xml",
+            "xl/drawings/drawing1.xml#0",
             12.0,
             8.0,
             CalculationOptions::default(),
@@ -4645,7 +4837,7 @@ fn collaborative_sessions_refuse_a_chart_move() {
         standalone
             .move_chart(
                 SheetId(0),
-                "xl/charts/chart1.xml",
+                "xl/drawings/drawing1.xml#0",
                 12.0,
                 8.0,
                 CalculationOptions::default()
