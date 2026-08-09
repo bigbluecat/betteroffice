@@ -1427,6 +1427,10 @@ impl Workbook {
 
     /// Slide a chart by `dx`/`dy` content pixels, clamped to the grid. One undo
     /// step; the new anchor is written back on save.
+    ///
+    /// Two sheets may anchor the same drawing at the same index, which is one
+    /// element in one part. Every sheet holding it is repinned together, or the
+    /// save would refuse a drawing its sheets no longer agree on.
     pub fn move_chart(
         &mut self,
         sheet: SheetId,
@@ -1443,6 +1447,8 @@ impl Workbook {
             .ok_or_else(|| {
                 Error::InvalidOperation(format!("no chart on this sheet is backed by {part}"))
             })?;
+        let drawing = chart.drawing.clone();
+        let anchor_index = chart.anchor_index;
         let anchor = moved_chart_anchor(
             chart.anchor,
             &GridGeometry::new(sheet_ref),
@@ -1454,14 +1460,23 @@ impl Workbook {
                 "chart {part} is pinned to the sheet and cannot be moved"
             ))
         })?;
-        self.apply_ops(
-            vec![Op::SetChartAnchor {
-                sheet,
-                part: part.to_owned(),
-                anchor,
-            }],
-            options,
-        )
+        let ops = self
+            .model
+            .sheets
+            .iter()
+            .enumerate()
+            .flat_map(|(index, held)| {
+                held.charts
+                    .iter()
+                    .filter(|chart| chart.drawing == drawing && chart.anchor_index == anchor_index)
+                    .map(move |chart| Op::SetChartAnchor {
+                        sheet: SheetId(index as u32),
+                        part: chart.part.clone(),
+                        anchor,
+                    })
+            })
+            .collect();
+        self.apply_ops(ops, options)
     }
 
     #[cfg(feature = "raster")]

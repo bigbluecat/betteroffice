@@ -3399,6 +3399,31 @@ fn charted_fixture() -> Vec<u8> {
     ooxml_opc::rezip_parts(&parts).unwrap()
 }
 
+/// The charted fixture with a second sheet pointing at the *same* drawing, so
+/// one anchor element is held by two sheets at once.
+fn shared_drawing_fixture() -> Vec<u8> {
+    let mut parts = ooxml_opc::unzip_parts(&charted_fixture()).unwrap();
+    let workbook = test_part_text(&parts, "xl/workbook.xml").replace(
+        "</sheets>",
+        r#"<sheet name="Mirror" sheetId="9" r:id="rIdMirror"/></sheets>"#,
+    );
+    set_test_part(&mut parts, "xl/workbook.xml", workbook.into_bytes());
+    let rels = test_part_text(&parts, "xl/_rels/workbook.xml.rels").replace(
+        "</Relationships>",
+        r#"<Relationship Id="rIdMirror" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#,
+    );
+    set_test_part(&mut parts, "xl/_rels/workbook.xml.rels", rels.into_bytes());
+    parts.push((
+        "xl/worksheets/sheet2.xml".to_owned(),
+        br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData/><drawing r:id="rIdDrawing"/></worksheet>"#.to_vec(),
+    ));
+    parts.push((
+        "xl/worksheets/_rels/sheet2.xml.rels".to_owned(),
+        br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdDrawing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#.to_vec(),
+    ));
+    ooxml_opc::rezip_parts(&parts).unwrap()
+}
+
 /// The charted fixture with a second sheet the chart plots, so removing that
 /// sheet strands a reference a chart on another sheet owns.
 fn cross_sheet_charted_fixture() -> Vec<u8> {
@@ -4613,24 +4638,93 @@ fn set_chart_anchor_refuses_what_a_save_cannot_write() {
     assert_eq!(reopened.model().sheets[0].charts[0].anchor, resized);
 }
 
-/// Chart state lives in the shared document as one blob per sheet, so repinning
-/// one is structural and a collaborative session refuses it outright — the same
-/// answer freeze panes and hyperlinks give. Moving a chart is a standalone-only
-/// edit, and nothing partial is left behind by the refusal.
+/// A chart anchor is replicated content, not workbook structure: the freeze
+/// pins which drawing anchors which part, and where that anchor sits travels
+/// through the document like any other edit.
 #[test]
-fn collaborative_sessions_refuse_a_chart_move() {
+fn collaborative_sessions_move_a_chart_and_converge() {
     let bytes = charted_fixture();
-    let mut workbook = Workbook::open_collaborative(&bytes, 303).unwrap();
-    let before = workbook.model().clone();
+    let mut left = Workbook::open_collaborative(&bytes, 303).unwrap();
+    let mut right = Workbook::open_collaborative(&bytes, 304).unwrap();
+    let before = left.model().sheets[0].charts[0].anchor;
 
-    let error = workbook
-        .move_chart(
+    assert!(
+        left.move_chart(
             SheetId(0),
             "xl/charts/chart1.xml",
             12.0,
             8.0,
             CalculationOptions::default(),
         )
+        .unwrap()
+        .applied
+    );
+    let moved = left.model().sheets[0].charts[0].anchor;
+    assert_ne!(moved, before);
+
+    let update = left
+        .encode_diff_v1(&right.encode_state_vector_v1())
+        .unwrap();
+    assert!(
+        right
+            .apply_update_v1(&update, CalculationOptions::default())
+            .unwrap()
+            .applied
+    );
+    assert_eq!(right.model().sheets[0].charts[0].anchor, moved);
+    assert_eq!(right.model(), left.model());
+
+    // the move survives a save, and a later peer edit still merges.
+    let reopened = Workbook::open(&left.save().unwrap()).unwrap();
+    assert_eq!(reopened.model().sheets[0].charts[0].anchor, moved);
+    right
+        .edit_cell(
+            SheetId(0),
+            cell("A1"),
+            "after",
+            CalculationOptions::default(),
+        )
+        .unwrap();
+    let update = right
+        .encode_diff_v1(&left.encode_state_vector_v1())
+        .unwrap();
+    left.apply_update_v1(&update, CalculationOptions::default())
+        .unwrap();
+    assert_eq!(left.model().sheets[0].charts[0].anchor, moved);
+    assert_eq!(left.cell(SheetId(0), cell("A1")).unwrap().input, "after");
+
+    // the mover can take the drag back, and the peer follows it home.
+    assert!(left.can_undo());
+    assert!(left.undo(CalculationOptions::default()).unwrap().applied);
+    assert_eq!(left.model().sheets[0].charts[0].anchor, before);
+    let update = left
+        .encode_diff_v1(&right.encode_state_vector_v1())
+        .unwrap();
+    right
+        .apply_update_v1(&update, CalculationOptions::default())
+        .unwrap();
+    assert_eq!(right.model().sheets[0].charts[0].anchor, before);
+}
+
+/// Letting an anchor travel does not unfreeze the rest of a chart: an op that
+/// remaps what a chart reads is still structural, refused locally and refused
+/// again when a standalone peer offers it. This rides on the structure
+/// generation every structural op bumps; the identity fields themselves are
+/// pinned by `a_peer_cannot_disguise_a_chart_remap_as_a_move`, which leaves
+/// that counter alone.
+#[test]
+fn collaborative_sessions_still_refuse_a_chart_remap() {
+    let bytes = charted_fixture();
+    let mut workbook = Workbook::open_collaborative(&bytes, 305).unwrap();
+    let before = workbook.model().clone();
+    let insert_rows = Op::InsertRows {
+        sheet: SheetId(0),
+        at: 0,
+        count: 1,
+    };
+
+    let error = workbook
+        .apply_ops(vec![insert_rows.clone()], CalculationOptions::default())
         .unwrap_err();
     assert!(
         matches!(&error, Error::CollaborativeStructureOperation),
@@ -4638,21 +4732,136 @@ fn collaborative_sessions_refuse_a_chart_move() {
     );
     assert_eq!(workbook.model(), &before);
 
-    // the same move on a standalone session is accepted, so the refusal is the
-    // collaboration guard and not a broken op.
     let mut standalone = Workbook::open(&bytes).unwrap();
+    standalone
+        .apply_ops(vec![insert_rows], CalculationOptions::default())
+        .unwrap();
+    assert_ne!(
+        standalone.model().sheets[0].charts[0].refs,
+        before.sheets[0].charts[0].refs
+    );
+    let update = standalone
+        .encode_diff_v1(&workbook.encode_state_vector_v1())
+        .unwrap();
     assert!(
-        standalone
+        matches!(
+            workbook.apply_update_v1(&update, CalculationOptions::default()),
+            Err(Error::CollaborativeStructureChanged)
+        ),
+        "a chart remap must not slip past the freeze"
+    );
+    assert_eq!(workbook.model(), &before);
+}
+
+/// Two replicas dragging the same chart at once must land on one anchor, and
+/// on the same one whichever order the updates arrive in.
+#[test]
+fn concurrent_chart_moves_converge_in_either_delivery_order() {
+    let bytes = charted_fixture();
+    let settle = |first_wins: bool| {
+        let mut left = Workbook::open_collaborative(&bytes, 401).unwrap();
+        let mut right = Workbook::open_collaborative(&bytes, 402).unwrap();
+        left.move_chart(
+            SheetId(0),
+            "xl/charts/chart1.xml",
+            16.0,
+            0.0,
+            CalculationOptions::default(),
+        )
+        .unwrap();
+        right
             .move_chart(
                 SheetId(0),
                 "xl/charts/chart1.xml",
-                12.0,
-                8.0,
-                CalculationOptions::default()
+                0.0,
+                24.0,
+                CalculationOptions::default(),
+            )
+            .unwrap();
+        let to_right = left
+            .encode_diff_v1(&right.encode_state_vector_v1())
+            .unwrap();
+        let to_left = right
+            .encode_diff_v1(&left.encode_state_vector_v1())
+            .unwrap();
+        if first_wins {
+            right
+                .apply_update_v1(&to_right, CalculationOptions::default())
+                .unwrap();
+            left.apply_update_v1(&to_left, CalculationOptions::default())
+                .unwrap();
+        } else {
+            left.apply_update_v1(&to_left, CalculationOptions::default())
+                .unwrap();
+            right
+                .apply_update_v1(&to_right, CalculationOptions::default())
+                .unwrap();
+        }
+        let anchor = left.model().sheets[0].charts[0].anchor;
+        assert_eq!(
+            right.model().sheets[0].charts[0].anchor,
+            anchor,
+            "concurrent moves must converge"
+        );
+        anchor
+    };
+    assert_eq!(
+        settle(true),
+        settle(false),
+        "the winning anchor must not depend on delivery order"
+    );
+}
+
+/// One drawing anchor held by two sheets is one element in one part, so a drag
+/// repins every sheet holding it. Repinning only the dragged sheet would leave
+/// the two disagreeing and the save would refuse the drawing outright.
+#[test]
+fn a_drag_repins_every_sheet_sharing_the_drawing() {
+    let bytes = shared_drawing_fixture();
+    let mut workbook = Workbook::open_collaborative(&bytes, 403).unwrap();
+    assert_eq!(
+        workbook.model().sheets[1].charts[0].drawing,
+        workbook.model().sheets[0].charts[0].drawing,
+        "the fixture must share one drawing"
+    );
+    let before = workbook.model().sheets[0].charts[0].anchor;
+
+    assert!(
+        workbook
+            .move_chart(
+                SheetId(0),
+                "xl/charts/chart1.xml",
+                18.0,
+                9.0,
+                CalculationOptions::default(),
             )
             .unwrap()
             .applied
     );
+    let moved = workbook.model().sheets[0].charts[0].anchor;
+    assert_ne!(moved, before);
+    assert_eq!(
+        workbook.model().sheets[1].charts[0].anchor,
+        moved,
+        "the sheet sharing the anchor must follow it"
+    );
+
+    let saved = workbook
+        .save()
+        .expect("a shared drawing both sheets agree on must save");
+    let reopened = Workbook::open(&saved).unwrap();
+    assert_eq!(reopened.model().sheets[0].charts[0].anchor, moved);
+    assert_eq!(reopened.model().sheets[1].charts[0].anchor, moved);
+
+    // one undo takes both sheets back together.
+    assert!(
+        workbook
+            .undo(CalculationOptions::default())
+            .unwrap()
+            .applied
+    );
+    assert_eq!(workbook.model().sheets[0].charts[0].anchor, before);
+    assert_eq!(workbook.model().sheets[1].charts[0].anchor, before);
 }
 
 /// `SetCharts` is the inverse a remap emits; it is not something a caller may

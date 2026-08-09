@@ -5,9 +5,9 @@ use std::sync::Arc;
 use crate::sheet_json::{decode_charts, decode_hyperlinks};
 use sha2::{Digest, Sha256};
 use xlsx_model::{
-    Cell, CellFormat, CellRange, CellRef, CellValue, DateSystem, DefinedName, ErrorValue,
-    FreezePane, Hyperlink, MAX_COLS, MAX_ROWS, Sheet, SheetChart, SheetId, Stylesheet,
-    Workbook as WorkbookModel,
+    AnchorEditAs, AnchorExtent, AnchorPos, Cell, CellFormat, CellRange, CellRef, CellValue,
+    ChartAnchor, ChartRef, DateSystem, DefinedName, ErrorValue, FreezePane, Hyperlink, MAX_COLS,
+    MAX_ROWS, Sheet, SheetChart, SheetId, Stylesheet, Workbook as WorkbookModel,
 };
 use xlsx_ops::Op;
 use yrs::block::{
@@ -190,6 +190,61 @@ impl WorkbookBase {
     }
 }
 
+/// The part of an anchor no move may rewrite: its kind, plus whatever the
+/// drawing writer cannot patch. Only the grid markers a save writes whole stay
+/// free, so this mirrors `only_grid_position_moved` in the writer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AnchorShape {
+    TwoCell {
+        edit_as: AnchorEditAs,
+    },
+    OneCell {
+        extent: AnchorExtent,
+    },
+    Absolute {
+        pos: AnchorPos,
+        extent: AnchorExtent,
+    },
+}
+
+impl AnchorShape {
+    fn of(anchor: &ChartAnchor) -> Self {
+        match anchor {
+            ChartAnchor::TwoCell { edit_as, .. } => Self::TwoCell { edit_as: *edit_as },
+            ChartAnchor::OneCell { extent, .. } => Self::OneCell { extent: *extent },
+            ChartAnchor::Absolute { pos, extent } => Self::Absolute {
+                pos: *pos,
+                extent: *extent,
+            },
+        }
+    }
+}
+
+/// What the freeze pins about a chart: which drawing anchors which part, what
+/// the part reads, and the shape of that anchor. Only where a grid-anchored
+/// chart sits is replicated content, so a peer may slide one without changing
+/// the structure this describes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChartIdentity {
+    part: String,
+    drawing: String,
+    anchor_index: usize,
+    refs: Vec<ChartRef>,
+    anchor: AnchorShape,
+}
+
+impl ChartIdentity {
+    fn of(chart: &SheetChart) -> Self {
+        Self {
+            part: chart.part.clone(),
+            drawing: chart.drawing.clone(),
+            anchor_index: chart.anchor_index,
+            refs: chart.refs.clone(),
+            anchor: AnchorShape::of(&chart.anchor),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorkbookStructure {
     generation: i64,
@@ -197,7 +252,7 @@ pub(crate) struct WorkbookStructure {
     sheet_names: Vec<String>,
     freeze_panes: Vec<Option<FreezePane>>,
     hyperlinks: Vec<Vec<Hyperlink>>,
-    charts: Vec<Vec<SheetChart>>,
+    charts: Vec<Vec<ChartIdentity>>,
     merges: Vec<Vec<CellRange>>,
     shared_types: BTreeMap<String, SheetSharedTypes>,
 }
@@ -679,11 +734,19 @@ impl WorkbookAuthority {
         self.apply_history_change(true)
     }
 
+    /// Puts the document back when a history step turns out to be unreadable.
+    /// A peer can hide a malformed value behind a concurrent local one, so
+    /// undoing that local write can expose state no replica materializes;
+    /// leaving it in place would strand the authority ahead of the model the
+    /// caller still holds, with no update to send anyone.
     fn apply_history_change(
         &mut self,
         redo: bool,
     ) -> Result<Option<HistoryUpdate>, AuthorityError> {
         let state_vector = self.doc.transact().state_vector();
+        let restore = self.encode_state_as_update_v1();
+        let undo_stack = self.undo_stack.clone();
+        let redo_stack = self.redo_stack.clone();
         let mut undo =
             build_undo_manager(&self.doc, self.undo_stack.clone(), self.redo_stack.clone())
                 .map_err(AuthorityError::InvalidState)?;
@@ -698,15 +761,34 @@ impl WorkbookAuthority {
         if !applied {
             return Ok(None);
         }
-        let (model, structure) = self
-            .strict_materialize()
-            .map_err(AuthorityError::InvalidState)?;
+        let (model, structure) = match self.strict_materialize() {
+            Ok(materialized) => materialized,
+            Err(error) => {
+                self.rollback(&restore, undo_stack, redo_stack)?;
+                return Err(AuthorityError::InvalidState(error));
+            }
+        };
         let update = self.doc.transact().encode_diff_v1(&state_vector);
         Ok(Some(HistoryUpdate {
             model,
             structure,
             update,
         }))
+    }
+
+    /// Rebuilds the document from a state captured before a failed step.
+    fn rollback(
+        &mut self,
+        restore: &[u8],
+        undo_stack: Vec<StackItem<()>>,
+        redo_stack: Vec<StackItem<()>>,
+    ) -> Result<(), AuthorityError> {
+        let doc = Doc::with_client_id(self.client_id());
+        hydrate_doc(&doc, restore).map_err(AuthorityError::InvalidState)?;
+        self.doc = doc;
+        self.undo_stack = undo_stack;
+        self.redo_stack = redo_stack;
+        Ok(())
     }
 
     pub(crate) fn clear_history(&mut self) {
@@ -951,7 +1033,7 @@ impl WorkbookAuthority {
             charts: model
                 .sheets
                 .iter()
-                .map(|sheet| sheet.charts.clone())
+                .map(|sheet| sheet.charts.iter().map(ChartIdentity::of).collect())
                 .collect(),
             merges: model
                 .sheets
@@ -1285,7 +1367,6 @@ pub(crate) fn is_structural_op(op: &Op) -> bool {
             | Op::RenameSheet { .. }
             | Op::RestoreSheet { .. }
             | Op::SetCharts { .. }
-            | Op::SetChartAnchor { .. }
             | Op::SetDefinedNames { .. }
     )
 }
@@ -3720,5 +3801,193 @@ mod tests {
         let (restored, structure) = authority.strict_materialize().unwrap();
         assert_eq!(restored, model);
         assert_eq!(structure.shared_types["sheet:1"], retained);
+    }
+
+    fn sliding_chart(name: &str) -> Sheet {
+        let mut sheet = Sheet::new(name);
+        sheet.charts.push(SheetChart {
+            part: "xl/charts/chart1.xml".to_owned(),
+            drawing: "xl/drawings/drawing1.xml".to_owned(),
+            anchor_index: 0,
+            anchor: ChartAnchor::TwoCell {
+                from: xlsx_model::AnchorCell::default(),
+                to: xlsx_model::AnchorCell {
+                    col: 4,
+                    col_off: 0,
+                    row: 8,
+                    row_off: 0,
+                },
+                edit_as: AnchorEditAs::TwoCell,
+            },
+            refs: vec![ChartRef {
+                kind: xlsx_model::ChartRefKind::Values,
+                formula: "Data!$A$1:$A$2".to_owned(),
+            }],
+        });
+        sheet
+    }
+
+    fn sliding_model() -> WorkbookModel {
+        let mut model = WorkbookModel::default();
+        model.sheets.push(sliding_chart("Report"));
+        model
+    }
+
+    /// An update that assigns a sheet's chart state without touching the
+    /// structure generation, as a peer forked from `authority`'s state.
+    fn peer_chart_update(authority: &WorkbookAuthority, client_id: u64, charts: &str) -> Vec<u8> {
+        let peer = Doc::with_client_id(client_id);
+        hydrate_doc(&peer, &authority.encode_state_as_update_v1()).unwrap();
+        let before = peer.transact().state_vector();
+        {
+            let mut txn = peer.transact_mut_with("test:peer-charts");
+            let sheets = txn.get_map(SHEETS).unwrap();
+            let sheet = sheets
+                .get(&txn, "sheet:0")
+                .and_then(|value| value.cast::<MapRef>().ok())
+                .unwrap();
+            sheet.try_update(&mut txn, CHARTS, charts);
+        }
+        peer.transact().encode_diff_v1(&before)
+    }
+
+    fn slid_anchor(cols: i64) -> ChartAnchor {
+        ChartAnchor::TwoCell {
+            from: xlsx_model::AnchorCell {
+                col: cols as u32,
+                ..xlsx_model::AnchorCell::default()
+            },
+            to: xlsx_model::AnchorCell {
+                col: 4 + cols as u32,
+                col_off: 0,
+                row: 8,
+                row_off: 0,
+            },
+            edit_as: AnchorEditAs::TwoCell,
+        }
+    }
+
+    /// The freeze pins what a chart *is*, so a peer cannot pass a remap off as
+    /// a move. The structure generation is untouched here, which is what makes
+    /// this the identity check rather than the generation counter.
+    #[test]
+    fn a_peer_cannot_disguise_a_chart_remap_as_a_move() {
+        let model = sliding_model();
+        let authority = WorkbookAuthority::from_model_with_client_id(&model, 41).unwrap();
+        let frozen = authority.structure().unwrap();
+        let generation = frozen.generation;
+
+        for (label, charts) in [
+            (
+                "refs",
+                r#"[{"part":"xl/charts/chart1.xml","drawing":"xl/drawings/drawing1.xml","anchorIndex":0,"anchor":{"kind":"twoCell","from":{"col":0,"colOff":0,"row":0,"rowOff":0},"to":{"col":4,"colOff":0,"row":8,"rowOff":0},"edit_as":"twoCell"},"refs":[{"kind":"values","formula":"Hijacked!$A$1"}]}]"#,
+            ),
+            (
+                "part",
+                r#"[{"part":"xl/charts/other.xml","drawing":"xl/drawings/drawing1.xml","anchorIndex":0,"anchor":{"kind":"twoCell","from":{"col":0,"colOff":0,"row":0,"rowOff":0},"to":{"col":4,"colOff":0,"row":8,"rowOff":0},"edit_as":"twoCell"},"refs":[{"kind":"values","formula":"Data!$A$1:$A$2"}]}]"#,
+            ),
+            (
+                "anchorIndex",
+                r#"[{"part":"xl/charts/chart1.xml","drawing":"xl/drawings/drawing1.xml","anchorIndex":3,"anchor":{"kind":"twoCell","from":{"col":0,"colOff":0,"row":0,"rowOff":0},"to":{"col":4,"colOff":0,"row":8,"rowOff":0},"edit_as":"twoCell"},"refs":[{"kind":"values","formula":"Data!$A$1:$A$2"}]}]"#,
+            ),
+        ] {
+            let update = peer_chart_update(&authority, 42, charts);
+            let staged = authority.stage_updates_v1(&[&update]).unwrap();
+            assert_eq!(
+                staged.structure.generation, generation,
+                "{label} must not move the generation, or it proves nothing"
+            );
+            assert_ne!(
+                staged.structure, frozen,
+                "a rewritten {label} must change the frozen structure"
+            );
+        }
+    }
+
+    /// A move may slide a grid-anchored chart and nothing else. The drawing
+    /// writer refuses a changed kind, `editAs` mode or one-cell extent, so the
+    /// freeze has to refuse them too rather than accept a workbook that can no
+    /// longer be saved.
+    #[test]
+    fn a_peer_cannot_reshape_an_anchor_a_save_can_only_slide() {
+        let model = sliding_model();
+        let authority = WorkbookAuthority::from_model_with_client_id(&model, 43).unwrap();
+        let frozen = authority.structure().unwrap();
+
+        for (label, charts) in [
+            (
+                "editAs",
+                r#"[{"part":"xl/charts/chart1.xml","drawing":"xl/drawings/drawing1.xml","anchorIndex":0,"anchor":{"kind":"twoCell","from":{"col":0,"colOff":0,"row":0,"rowOff":0},"to":{"col":4,"colOff":0,"row":8,"rowOff":0},"edit_as":"oneCell"},"refs":[{"kind":"values","formula":"Data!$A$1:$A$2"}]}]"#,
+            ),
+            (
+                "kind",
+                r#"[{"part":"xl/charts/chart1.xml","drawing":"xl/drawings/drawing1.xml","anchorIndex":0,"anchor":{"kind":"oneCell","from":{"col":0,"colOff":0,"row":0,"rowOff":0},"extent":{"cx":100000,"cy":100000}},"refs":[{"kind":"values","formula":"Data!$A$1:$A$2"}]}]"#,
+            ),
+        ] {
+            let update = peer_chart_update(&authority, 44, charts);
+            let staged = authority.stage_updates_v1(&[&update]).unwrap();
+            assert_ne!(
+                staged.structure, frozen,
+                "a rewritten anchor {label} must change the frozen structure"
+            );
+        }
+
+        // sliding the same anchor across the grid is the one accepted change.
+        let slid = r#"[{"part":"xl/charts/chart1.xml","drawing":"xl/drawings/drawing1.xml","anchorIndex":0,"anchor":{"kind":"twoCell","from":{"col":2,"colOff":0,"row":0,"rowOff":0},"to":{"col":6,"colOff":0,"row":8,"rowOff":0},"edit_as":"twoCell"},"refs":[{"kind":"values","formula":"Data!$A$1:$A$2"}]}]"#;
+        let update = peer_chart_update(&authority, 44, slid);
+        let staged = authority.stage_updates_v1(&[&update]).unwrap();
+        assert_eq!(staged.structure, frozen);
+    }
+
+    /// A peer's chart write can lose the merge to a concurrent local one and
+    /// sit in the document unseen. Undoing the local write must not strand the
+    /// authority on state it cannot read: the step is refused and the replica
+    /// stays exactly as usable as it was.
+    #[test]
+    fn a_hidden_chart_conflict_leaves_the_replica_usable() {
+        let model = sliding_model();
+        let mut authority = WorkbookAuthority::from_model_with_client_id(&model, 304).unwrap();
+        let frozen = authority.structure().unwrap();
+        let hostile = peer_chart_update(
+            &authority,
+            111,
+            r#"[{"part":"xl/charts/chart1.xml","drawing":"xl/drawings/drawing1.xml","anchorIndex":0,"anchor":{"kind":"twoCell","from":{"col":0,"colOff":0,"row":0,"rowOff":0},"to":{"col":4,"colOff":0,"row":8,"rowOff":0},"edit_as":"twoCell"},"refs":[{"kind":"values","formula":"Hijacked!$A$1"}]}]"#,
+        );
+
+        let ops = [Op::SetChartAnchor {
+            sheet: SheetId(0),
+            part: "xl/charts/chart1.xml".to_owned(),
+            anchor: slid_anchor(2),
+        }];
+        let local = authority
+            .stage_local_ops_v1(&ops, SyncOrigin::User)
+            .unwrap();
+        authority
+            .apply_local_update_v1(&local.update, SyncOrigin::User)
+            .unwrap();
+
+        // the hostile value loses the merge, so the freeze sees only the move.
+        let staged = authority.stage_updates_v1(&[&hostile]).unwrap();
+        assert_eq!(staged.structure, frozen);
+        authority.apply_update_v1(&staged.commit_update).unwrap();
+        let merged = authority.materialize().unwrap();
+        assert_eq!(
+            merged.sheets[0].charts[0].refs,
+            model.sheets[0].charts[0].refs
+        );
+
+        // undoing the move may fail, but never by leaving the document behind.
+        let undone = authority.undo();
+        let after = authority
+            .materialize()
+            .expect("a refused undo must leave a readable document");
+        match undone {
+            Ok(_) => assert_eq!(
+                after.sheets[0].charts[0].refs,
+                model.sheets[0].charts[0].refs
+            ),
+            Err(_) => assert_eq!(after, merged),
+        }
+        assert_eq!(authority.structure().unwrap(), frozen);
     }
 }
